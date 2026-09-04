@@ -1,0 +1,80 @@
+name: pilot_macos_bundle
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths:
+      - '.github/actions/setup_macos/**'
+      - '.github/workflows/pilot_macos_bundle.yml'
+      - 'cpp/binary/pilot/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'Makefile'
+  workflow_dispatch:
+
+concurrency:
+  group: pilot_macos_bundle-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  bundle_metadata:
+
+    name: Build and check pilot.app metadata
+
+    runs-on: macos-26
+
+    timeout-minutes: 45
+
+    env:
+      BUILD_PATH: build/pilot_macos_bundle
+      PILOT_BUNDLE_IDENTIFIER: net.solvcon.pilot
+      PILOT_BUNDLE_VERSION: 0.0.1
+      PILOT_BUNDLE_BUILD_VERSION: '1'
+      PILOT_BUNDLE_CATEGORY: public.app-category.developer-tools
+      PILOT_BUNDLE_COPYRIGHT: Copyright (c) 2026, solvcon team
+      PILOT_MINIMUM_MACOS_VERSION: '15.0'
+
+    steps:
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: setup dependencies for macOS
+        uses: ./.github/actions/setup_macos
+        with:
+          workflow: 'build'
+
+      - name: build pilot.app
+        run: |
+          make pilot \
+            BUILD_PATH="${BUILD_PATH}" \
+            BUILD_QT=ON \
+            BUILD_METAL=ON \
+            CMAKE_BUILD_TYPE=Release \
+            CMAKE_ARGS="-DPYTHON_EXECUTABLE=$(which python3) \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=${PILOT_MINIMUM_MACOS_VERSION}"
+
+      - name: check Info.plist
+        run: |
+          plist="${BUILD_PATH}/cpp/binary/pilot/pilot.app/Contents/Info.plist"
+          plutil -lint "${plist}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${plist}")" = "${PILOT_BUNDLE_IDENTIFIER}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${plist}")" = "${PILOT_BUNDLE_VERSION}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${plist}")" = "${PILOT_BUNDLE_BUILD_VERSION}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSApplicationCategoryType' "${plist}")" = "${PILOT_BUNDLE_CATEGORY}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${plist}")" = "${PILOT_MINIMUM_MACOS_VERSION}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSHumanReadableCopyright' "${plist}")" = "${PILOT_BUNDLE_COPYRIGHT}"
+          plutil -p "${plist}"
+
+      - name: upload Info.plist
+        uses: actions/upload-artifact@v7
+        with:
+          name: pilot-macos-info-plist
+          path: ${{ env.BUILD_PATH }}/cpp/binary/pilot/pilot.app/Contents/Info.plist
+
+# vim: set ft=yaml ff=unix fenc=utf8 et sw=2 ts=2 sts=2:

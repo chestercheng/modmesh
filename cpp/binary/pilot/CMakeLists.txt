@@ -26,6 +26,22 @@ find_package(Qt6 COMPONENTS Svg)
 find_package(Qt6 QUIET OPTIONAL_COMPONENTS GuiPrivate)
 
 if(APPLE)
+    set(PILOT_BUNDLE_IDENTIFIER "net.solvcon.pilot" CACHE STRING
+        "macOS bundle identifier for pilot")
+    set(PILOT_BUNDLE_VERSION "0.0.1" CACHE STRING
+        "macOS bundle version for pilot")
+    set(PILOT_BUNDLE_BUILD_VERSION "1" CACHE STRING
+        "macOS bundle build version for pilot")
+    set(PILOT_BUNDLE_CATEGORY "public.app-category.developer-tools" CACHE STRING
+        "macOS App Store category for pilot")
+    set(PILOT_BUNDLE_COPYRIGHT "Copyright (c) 2026, solvcon team" CACHE STRING
+        "macOS bundle copyright for pilot")
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(PILOT_MINIMUM_MACOS_VERSION "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    else()
+        set(PILOT_MINIMUM_MACOS_VERSION "15.0")
+    endif()
+
     set(MACOSX_BUNDLE_ICON_FILE solvcon.icns)
     set(app_icon_macos ${PROJECT_ROOT_DIR}/resources/pilot/solvcon.icns)
     set_source_files_properties(${app_icon_macos} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
@@ -109,6 +125,16 @@ set_target_properties(
 )
 
 if(APPLE)
+    set_target_properties(
+        pilot PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in
+        MACOSX_BUNDLE_GUI_IDENTIFIER ${PILOT_BUNDLE_IDENTIFIER}
+        MACOSX_BUNDLE_BUNDLE_NAME "solvcon Pilot"
+        MACOSX_BUNDLE_BUNDLE_VERSION ${PILOT_BUNDLE_BUILD_VERSION}
+        MACOSX_BUNDLE_SHORT_VERSION_STRING ${PILOT_BUNDLE_VERSION}
+        MACOSX_BUNDLE_COPYRIGHT ${PILOT_BUNDLE_COPYRIGHT}
+    )
+
     find_library(APPLE_FWK_QUARTZ_CORE QuartzCore REQUIRED)
 
     target_link_libraries(
