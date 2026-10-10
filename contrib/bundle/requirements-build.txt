@@ -1,0 +1,4 @@
+# Python build dependencies that are not shipped in the Pilot bundle.
+pybind11==3.0.1
+
+# vim: set ft=requirements ff=unix fenc=utf8 et sw=4 ts=4 sts=4 tw=79:

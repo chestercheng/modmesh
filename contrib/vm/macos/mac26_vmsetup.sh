@@ -111,14 +111,15 @@ step_dependency() {
     log "Installing solvcon build/runtime dependencies via Homebrew"
     brew install \
         tree gh cmake clang-format qt pyside \
-        python numpy python-matplotlib pybind11 \
-        pytest flake8 black
+        python pybind11
 
-    log "Installing extra Python packages"
+    log "Installing Python development packages with pip"
     # We do not use venv, so just install without respecting PEP-668. It's OK
     # for a VM for automation, but may not be a good idea for a setup for
     # everyday work.
-    pip3 install jsonschema pyyaml --break-system-packages
+    python3 -m pip install --break-system-packages \
+        numpy matplotlib Pillow jsonschema lz4 zstandard \
+        pytest flake8 black pyyaml
 }
 
 step_claude() {
