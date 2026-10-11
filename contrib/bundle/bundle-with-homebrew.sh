@@ -2,7 +2,7 @@
 #
 # This script is a prototype to create a self-contained macOS .app bundle for
 # solvcon, package it into a DMG file, and verify both are hermetic. It employs
-# macdeployqt, otool, and install_name_tool to process the binaires, and ad-hoc
+# macdeployqt, otool, and install_name_tool to process the binaries, and ad-hoc
 # codesign to reseal them.
 #
 # !! WARNING !!
@@ -11,15 +11,20 @@
 # it in a development or production machine.
 #
 # Usage:
-#   ./contrib/bundle/bundle-with-homebrew.sh check --dependency-prefix DIR
+#   ./contrib/bundle/bundle-with-homebrew.sh check --dependency-prefix DIR \
+#       --runtime-python-env DIR --build-python-env DIR
 #   ./contrib/bundle/bundle-with-homebrew.sh bundle [--skip-build]
 #                                                   [--skip-check]
 #                                                   --dependency-prefix DIR
+#                                                   --runtime-python-env DIR
+#                                                   --build-python-env DIR
 #                                                   [--output DIR]
 #   ./contrib/bundle/bundle-with-homebrew.sh verify path/to/pilot.dmg
 #
 # Legacy usage without a subcommand still runs the bundle step:
 #   ./contrib/bundle/bundle-with-homebrew.sh --dependency-prefix DIR
+#                                            --runtime-python-env DIR
+#                                            --build-python-env DIR
 #                                            [--skip-build] [--skip-check]
 #                                            [--output DIR]
 #
@@ -27,6 +32,10 @@
 #   --skip-check   Skip the bundle/DMG verification phase.
 #   --dependency-prefix DIR
 #                  Copy native dependencies from DIR.
+#   --runtime-python-env DIR
+#                  Copy pip runtime packages from DIR.
+#   --build-python-env DIR
+#                  Load pybind11 build metadata from DIR.
 #   --output DIR   Write pilot.dmg into DIR (default: build/).
 
 set -euo pipefail
@@ -36,6 +45,8 @@ BUNDLE_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$BUNDLE_REPO_ROOT"
 
 MIN_LOADS=${MIN_LOADS:-50}
+MACOS_ARCHITECTURES=arm64
+MACOS_DEPLOYMENT_TARGET=26.0
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -43,16 +54,16 @@ MIN_LOADS=${MIN_LOADS:-50}
 usage() {
     cat <<'EOF'
 Usage:
-  contrib/bundle/bundle-with-homebrew.sh check --dependency-prefix DIR
-  contrib/bundle/bundle-with-homebrew.sh bundle --dependency-prefix DIR [--skip-build] [--skip-check] [--output DIR]
+  contrib/bundle/bundle-with-homebrew.sh check --dependency-prefix DIR --runtime-python-env DIR --build-python-env DIR
+  contrib/bundle/bundle-with-homebrew.sh bundle --dependency-prefix DIR --runtime-python-env DIR --build-python-env DIR [--skip-build] [--skip-check] [--output DIR]
   contrib/bundle/bundle-with-homebrew.sh verify path/to/pilot.dmg
-  contrib/bundle/bundle-with-homebrew.sh all --dependency-prefix DIR [--skip-build] [--skip-check] [--output DIR]
+  contrib/bundle/bundle-with-homebrew.sh all --dependency-prefix DIR --runtime-python-env DIR --build-python-env DIR [--skip-build] [--skip-check] [--output DIR]
 
 Subcommands:
   check    Check macOS bundle release dependencies. Does not build or install.
   bundle   Build/package pilot.app and pilot.dmg with native dependencies.
   verify   Verify a generated release DMG artifact.
-  all      Run check and then bundle. (No verify.)
+  all      Run check and then bundle.
 EOF
 }
 
@@ -70,6 +81,7 @@ setup_hint() {
 For a fresh macOS bundling environment, try:
   bash contrib/vm/macos/mac26_vmsetup.sh homebrew
   bash contrib/vm/macos/mac26_vmsetup.sh dependency
+  make bundle-deps RELEASE_DEPENDENCY_PREFIX="$(brew --prefix)"
 EOF
 }
 
@@ -83,19 +95,26 @@ require_command() {
 }
 
 python_module_check() {
-    local module="$1" hint="${2:-}" out
+    local module="$1" hint="${2:-}" expected="${3:-}" out
     out=$(mktemp -t solvcon-bundle-pycheck)
-    if PYTHONNOUSERSITE=1 "$PYTHON" -s - "$module" <<'PY' >"$out" 2>&1
+    if PYTHONPATH="$RUNTIME_SITE" PYTHONNOUSERSITE=1 \
+        "$PYTHON" -s - "$module" "$expected" <<'PY' >"$out" 2>&1
 import importlib
+import os
 import sys
 module = sys.argv[1]
+expected = sys.argv[2]
 try:
     mod = importlib.import_module(module)
 except Exception as e:
     print(f"{type(e).__name__}: {e}")
     raise SystemExit(1)
 else:
-    print(getattr(mod, "__file__", "built-in"))
+    path = os.path.realpath(getattr(mod, "__file__", ""))
+    if expected and os.path.commonpath((path, expected)) != expected:
+        print(f"{module} is outside {expected}: {path}")
+        raise SystemExit(1)
+    print(path or "built-in")
 PY
     then
         ok "python module $module: $(cat "$out")"
@@ -126,25 +145,31 @@ PY
 
 check_pybind11_cmake() {
     local config_dir
-    if [[ -x "$DEPENDENCY_PREFIX/bin/pybind11-config" ]]; then
-        config_dir=$("$DEPENDENCY_PREFIX/bin/pybind11-config" --cmakedir \
+    if [[ -x "$BUILD_PYTHON" ]]; then
+        config_dir=$("$BUILD_PYTHON" -m pybind11 --cmakedir \
             2>/dev/null || true)
         if [[ -n "$config_dir" && -f "$config_dir/pybind11Config.cmake" ]]; then
             ok "pybind11 CMake config: $config_dir/pybind11Config.cmake"
             return 0
         fi
     fi
-    fail "pybind11 CMake config: not found under the active dependency prefix"
+    fail "pybind11 CMake config: not found in $BUILD_PYTHON_ENV"
 }
 
 check_deps() {
-    local fw_path failed=0
+    local fw_path base_abi runtime_abi build_abi failed=0
     require_macos
+
+    if [[ "$(uname -m)" == "$MACOS_ARCHITECTURES" ]]; then
+        ok "macOS architecture: $MACOS_ARCHITECTURES"
+    else
+        fail "macOS architecture: $(uname -m) (expected $MACOS_ARCHITECTURES)" || failed=1
+    fi
 
     ok "Native dependency prefix: $DEPENDENCY_PREFIX"
 
-    for cmd in cmake make otool \
-        install_name_tool codesign hdiutil rsync shasum; do
+    for cmd in cmake file make otool \
+        install_name_tool codesign hdiutil lipo rsync shasum; do
         require_command "$cmd" || failed=1
     done
 
@@ -155,18 +180,44 @@ check_deps() {
     [[ -x "$QTPATHS" ]] && ok "qtpaths: $QTPATHS" || \
         { fail "qtpaths: not found at $QTPATHS" || true; failed=1; }
 
+    base_abi=$("$PYTHON" -c \
+        'import platform, sys; print("%d.%d-%s" % (*sys.version_info[:2], platform.machine()))')
+    runtime_abi=$("$RUNTIME_PYTHON" -c \
+        'import platform, sys; print("%d.%d-%s" % (*sys.version_info[:2], platform.machine()))')
+    build_abi=$("$BUILD_PYTHON" -c \
+        'import platform, sys; print("%d.%d-%s" % (*sys.version_info[:2], platform.machine()))')
+    if [[ "$base_abi" == "$runtime_abi" && "$base_abi" == "$build_abi" ]]; then
+        ok "Python ABI: $base_abi"
+    else
+        fail "Python ABI mismatch: base=$base_abi runtime=$runtime_abi build=$build_abi" || failed=1
+    fi
+
     if fw_path=$(python_framework_check 2>&1); then
-        ok "Python framework dylib: $fw_path"
+        case "$fw_path" in
+        "$DEPENDENCY_PREFIX"/*) ok "Python framework dylib: $fw_path" ;;
+        *) fail "Python framework is outside $DEPENDENCY_PREFIX: $fw_path" || failed=1 ;;
+        esac
     else
         fail "$fw_path" || failed=1
     fi
 
     check_pybind11_cmake || failed=1
-    python_module_check numpy "brew install numpy" || failed=1
-    python_module_check PySide6 "brew install pyside" || failed=1
-    python_module_check shiboken6 "brew install pyside" || failed=1
-    python_module_check shiboken6_generator "brew install pyside" || failed=1
-    python_module_check matplotlib "brew install python-matplotlib" || failed=1
+    python_module_check numpy "make bundle-deps" "$RUNTIME_SITE" || failed=1
+    python_module_check PySide6 "brew install pyside" \
+        "$DEPENDENCY_PREFIX" || failed=1
+    python_module_check shiboken6 "brew install pyside" \
+        "$DEPENDENCY_PREFIX" || failed=1
+    python_module_check shiboken6_generator "brew install pyside" \
+        "$DEPENDENCY_PREFIX" || failed=1
+    python_module_check matplotlib.pyplot \
+        "make bundle-deps" "$RUNTIME_SITE" || failed=1
+    python_module_check PIL "make bundle-deps" "$RUNTIME_SITE" || failed=1
+    python_module_check jsonschema "make bundle-deps" \
+        "$RUNTIME_SITE" || failed=1
+    python_module_check lz4.frame "make bundle-deps" \
+        "$RUNTIME_SITE" || failed=1
+    python_module_check zstandard "make bundle-deps" \
+        "$RUNTIME_SITE" || failed=1
 
     if [[ $failed -ne 0 ]]; then
         setup_hint
@@ -389,6 +440,8 @@ esac
 SKIP_BUILD=0
 SKIP_CHECK=0
 DEPENDENCY_PREFIX=""
+RUNTIME_PYTHON_ENV=""
+BUILD_PYTHON_ENV=""
 OUTPUT_DIR="$BUNDLE_REPO_ROOT/build"
 
 if [[ "$COMMAND" == "check" || "$COMMAND" == "bundle" || "$COMMAND" == "all" ]]; then
@@ -399,6 +452,16 @@ if [[ "$COMMAND" == "check" || "$COMMAND" == "bundle" || "$COMMAND" == "all" ]];
         --dependency-prefix)
             [[ $# -ge 2 ]] || { echo "Missing argument for --dependency-prefix" >&2; usage >&2; exit 2; }
             DEPENDENCY_PREFIX="$2"
+            shift 2
+            ;;
+        --runtime-python-env)
+            [[ $# -ge 2 ]] || { echo "Missing argument for --runtime-python-env" >&2; usage >&2; exit 2; }
+            RUNTIME_PYTHON_ENV="$2"
+            shift 2
+            ;;
+        --build-python-env)
+            [[ $# -ge 2 ]] || { echo "Missing argument for --build-python-env" >&2; usage >&2; exit 2; }
+            BUILD_PYTHON_ENV="$2"
             shift 2
             ;;
             --output)
@@ -422,9 +485,28 @@ if [[ "$COMMAND" != "verify" ]]; then
     DEPENDENCY_PREFIX=$(cd "$DEPENDENCY_PREFIX" && pwd -P)
     [[ "$DEPENDENCY_PREFIX" != "/" ]] || \
         { echo "Dependency prefix must not be the filesystem root" >&2; exit 1; }
+    [[ -d "$RUNTIME_PYTHON_ENV" ]] || \
+        { echo "Runtime Python environment not found: $RUNTIME_PYTHON_ENV" >&2; exit 1; }
+    [[ -d "$BUILD_PYTHON_ENV" ]] || \
+        { echo "Build Python environment not found: $BUILD_PYTHON_ENV" >&2; exit 1; }
+    RUNTIME_PYTHON_ENV=$(cd "$RUNTIME_PYTHON_ENV" && pwd -P)
+    BUILD_PYTHON_ENV=$(cd "$BUILD_PYTHON_ENV" && pwd -P)
     PYTHON="$DEPENDENCY_PREFIX/bin/python3"
     MACDEPLOYQT="$DEPENDENCY_PREFIX/bin/macdeployqt"
     QTPATHS="$DEPENDENCY_PREFIX/bin/qtpaths"
+    RUNTIME_PYTHON="$RUNTIME_PYTHON_ENV/bin/python"
+    BUILD_PYTHON="$BUILD_PYTHON_ENV/bin/python"
+    [[ -x "$RUNTIME_PYTHON" ]] || \
+        { echo "Runtime Python not found: $RUNTIME_PYTHON" >&2; exit 1; }
+    [[ -x "$BUILD_PYTHON" ]] || \
+        { echo "Build Python not found: $BUILD_PYTHON" >&2; exit 1; }
+    RUNTIME_SITE=$("$RUNTIME_PYTHON" -c \
+        'import sysconfig; print(sysconfig.get_path("purelib"))')
+    PYBIND11_CMAKE_DIR=$("$BUILD_PYTHON" -m pybind11 --cmakedir)
+    [[ -d "$RUNTIME_SITE" ]] || \
+        { echo "Runtime site-packages not found: $RUNTIME_SITE" >&2; exit 1; }
+    [[ -d "$PYBIND11_CMAKE_DIR" ]] || \
+        { echo "pybind11 CMake config not found: $PYBIND11_CMAKE_DIR" >&2; exit 1; }
 fi
 
 if [[ "$COMMAND" == "all" ]]; then
@@ -494,78 +576,55 @@ case "$PY_FW" in
     *) echo "ERROR: Python.framework is outside $DEPENDENCY_PREFIX: $PY_FW" >&2; exit 1 ;;
 esac
 
-# Every site-packages dir the embedded interpreter would search, expanded
-# through .pth files (so packages installed under separate Homebrew prefixes
-# such as the matplotlib keg are found). macOS bash 3.2 has no mapfile; read
-# into an array with a loop.
-SITE_DIRS=()
+# PySide6 and shiboken6 belong to the Homebrew Qt stack. Locate their complete
+# package directories explicitly; every other Python package comes from the
+# isolated pip runtime environment.
+QT_PYTHON_PATHS=()
 while IFS= read -r line; do
-    SITE_DIRS+=("$line")
-done < <(PYTHONNOUSERSITE=1 "$PYTHON" -s -c "
-import site, os
-seen, out = set(), []
-def add(p):
-    p = os.path.realpath(p)
-    if p in seen or not os.path.isdir(p):
-        return
-    seen.add(p); out.append(p)
-    for f in sorted(os.listdir(p)):
-        if not f.endswith('.pth'):
-            continue
-        try:
-            with open(os.path.join(p, f)) as fp:
-                for line in fp:
-                    line = line.strip()
-                    if line and not line.startswith(('#', 'import ')):
-                        add(line if os.path.isabs(line) else os.path.join(p, line))
-        except OSError:
-            pass
-for d in site.getsitepackages():
-    add(d)
-print('\n'.join(out))
+    [[ -n "$line" ]] && QT_PYTHON_PATHS+=("$line")
+done < <(PYTHONPATH="$RUNTIME_SITE" PYTHONNOUSERSITE=1 "$PYTHON" -s -c "
+import importlib, os
+for name in ('PySide6', 'shiboken6'):
+    mod = importlib.import_module(name)
+    print(os.path.realpath(os.path.dirname(mod.__file__)))
 ")
 
-# Resolve the closure of Python packages pilot actually imports, so Step 4
-# copies only those, not the developer's full site-packages (which can
-# contain unrelated packages: vtkmodules, openvino, PyQt6, ...). Override
-# seeds via BUNDLE_SEED_MODULES; force-add via BUNDLE_EXTRA_PACKAGES (for
-# lazy / runtime imports the probe cannot observe, e.g. matplotlib backends
-# loaded on first render). Failed seed imports go to stderr so a partial
-# closure is visible instead of silently shipping a broken bundle.
-WANTED_PATHS=()
+for path in "${QT_PYTHON_PATHS[@]}"; do
+    case "$path" in
+        "$DEPENDENCY_PREFIX"/*) ;;
+        *) echo "ERROR: Qt Python package is outside $DEPENDENCY_PREFIX: $path" >&2; exit 1 ;;
+    esac
+done
+
+QT_METADATA_PATHS=()
 while IFS= read -r line; do
-    [[ -n "$line" ]] && WANTED_PATHS+=("$line")
-done < <(PYTHONNOUSERSITE=1 "$PYTHON" -s -c "
-import importlib, os, sys
-seeds = os.environ.get('BUNDLE_SEED_MODULES',
-    'PySide6.QtCore,PySide6.QtWidgets,PySide6.QtGui,numpy,matplotlib,'
-    'dateutil.relativedelta,dateutil.tz,dateutil.parser').split(',')
-extras = os.environ.get('BUNDLE_EXTRA_PACKAGES', '').split(',')
-for m in seeds + extras:
-    m = m.strip()
-    if not m: continue
-    try: importlib.import_module(m)
-    except Exception as e:
-        sys.stderr.write('    WARN: seed import %s failed: %s\n' % (m, e))
-out = set()
-for name, mod in list(sys.modules.items()):
-    if mod is None or '.' in name: continue
-    p = getattr(mod, '__path__', None)
-    f = getattr(mod, '__file__', None) or ''
-    if p:
-        for d in p:
-            if 'site-packages' in d:
-                out.add(os.path.realpath(d)); break
-    elif 'site-packages' in f:
-        out.add(os.path.realpath(f))
-print('\n'.join(sorted(out)))
+    [[ -n "$line" ]] && QT_METADATA_PATHS+=("$line")
+done < <(PYTHONPATH="$RUNTIME_SITE" PYTHONNOUSERSITE=1 "$PYTHON" -s -c "
+import importlib.metadata, os
+for name in ('PySide6', 'shiboken6'):
+    try:
+        dist = importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        continue
+    print(os.path.realpath(dist._path))
 ")
+
+for path in "${QT_METADATA_PATHS[@]}"; do
+    case "$path" in
+        "$DEPENDENCY_PREFIX"/*) ;;
+        *) echo "ERROR: Qt Python metadata is outside $DEPENDENCY_PREFIX: $path" >&2; exit 1 ;;
+    esac
+done
 
 echo "==> Build path : $BUILD_PATH"
 echo "==> App bundle : $APP"
 echo "==> Python fw  : $PY_FW"
-for d in "${SITE_DIRS[@]}"; do
-    echo "==> site-pkgs  : $d"
+echo "==> pip runtime: $RUNTIME_SITE"
+echo "==> pip build  : $PYBIND11_CMAKE_DIR"
+echo "==> macOS arch : $MACOS_ARCHITECTURES"
+echo "==> macOS min  : $MACOS_DEPLOYMENT_TARGET"
+for path in "${QT_PYTHON_PATHS[@]}"; do
+    echo "==> Qt Python  : $path"
 done
 
 [[ -f "$PY_DYLIB" ]] || { echo "ERROR: Python dylib not found at $PY_DYLIB" >&2; exit 1; }
@@ -584,7 +643,12 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     rm -rf "$BUNDLE_REPO_ROOT/$BUILD_PATH"
     echo "==> make pilot BUILD_PATH=$BUILD_PATH"
     env PATH="$DEPENDENCY_PREFIX/bin:$PATH" \
+        PYTHONPATH="$RUNTIME_SITE" \
         CMAKE_PREFIX_PATH="$DEPENDENCY_PREFIX" \
+        CMAKE_OSX_ARCHITECTURES="$MACOS_ARCHITECTURES" \
+        CMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
+        PYTHON_EXECUTABLE="$PYTHON" \
+        pybind11_DIR="$PYBIND11_CMAKE_DIR" \
         make pilot BUILD_PATH="$BUILD_PATH"
 fi
 
@@ -633,26 +697,19 @@ echo "    [Step 3 (Bundle Python framework): $((SECONDS - T_STEP))s]"
 
 T_STEP=$SECONDS
 echo "==> Copying Python packages into bundled site-packages"
-# Copy the closure resolved above (dir => rsync tree, file => cp).
-# -L dereferences symlinks. Falls back to every SITE_DIR if the probe
-# failed, so the script still runs when import discovery breaks.
-if [[ ${#WANTED_PATHS[@]} -gt 0 ]]; then
-    echo "    closure: ${#WANTED_PATHS[@]} entries (override via BUNDLE_SEED_MODULES / BUNDLE_EXTRA_PACKAGES)"
-    for path in "${WANTED_PATHS[@]}"; do
-        if [[ -d "$path" ]]; then
-            rsync -aL --exclude '__pycache__' --exclude '*.pth' \
-                "$path" "$BUNDLED_SITE/"
-        elif [[ -f "$path" ]]; then
-            cp -L "$path" "$BUNDLED_SITE/"
-        fi
-    done
-else
-    echo "    WARNING: import-closure discovery failed; copying full SITE_DIRS"
-    for SITE in "${SITE_DIRS[@]}"; do
-        rsync -aL --exclude '__pycache__' --exclude '*.pth' \
-            "$SITE/" "$BUNDLED_SITE/"
-    done
-fi
+PTH_FILE=$(find "$RUNTIME_SITE" -maxdepth 1 -name '*.pth' -print -quit)
+[[ -z "$PTH_FILE" ]] || {
+    echo "ERROR: runtime environment contains an unsupported .pth file: $PTH_FILE" >&2
+    exit 1
+}
+rsync -aL --exclude '__pycache__' "$RUNTIME_SITE/" "$BUNDLED_SITE/"
+
+for path in "${QT_PYTHON_PATHS[@]}"; do
+    rsync -aL --exclude '__pycache__' "$path" "$BUNDLED_SITE/"
+done
+for path in "${QT_METADATA_PATHS[@]}"; do
+    rsync -aL "$path" "$BUNDLED_SITE/"
+done
 echo "    [Step 4 (Bundle site-packages): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
@@ -964,34 +1021,32 @@ dedupe_pyside_qt() {
     fi
 }
 
-# Set PYTHONNOUSERSITE=1 in LSEnvironment so a Finder/open launch of pilot
-# never adds ~/Library/Python/<X.Y>/lib/python/site-packages to sys.path,
-# which on dev machines may carry a second PySide6 (and its Qt). Same
-# dual-instance crash as dedupe_pyside_qt fixes for the in-bundle case.
-inject_pythonnousersite() {
-    local plist="$APP/Contents/Info.plist"
+# Set the embedded Python environment for Finder/open launches. User packages
+# can carry a second PySide6, and writing a missing .pyc would invalidate the
+# app signature.
+inject_python_environment() {
+    local plist="$APP/Contents/Info.plist" name value
     [[ -f "$plist" ]] || { echo "    SKIP: no Info.plist at $plist" >&2; return 0; }
     # macdeployqt's Step 2 codesign locks Info.plist read-only; Step 7
     # re-locks it.
     chmod u+w "$plist"
-    if /usr/libexec/PlistBuddy -c "Print :LSEnvironment:PYTHONNOUSERSITE" \
-            "$plist" >/dev/null 2>&1; then
-        /usr/libexec/PlistBuddy -c \
-            "Set :LSEnvironment:PYTHONNOUSERSITE 1" "$plist" || {
-            echo "    ERROR: failed to set LSEnvironment.PYTHONNOUSERSITE" >&2
+    /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist" \
+        2>/dev/null || true
+    for name in PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE; do
+        value=1
+        if /usr/libexec/PlistBuddy -c "Print :LSEnvironment:$name" \
+                "$plist" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c \
+                "Set :LSEnvironment:$name $value" "$plist"
+        else
+            /usr/libexec/PlistBuddy -c \
+                "Add :LSEnvironment:$name string $value" "$plist"
+        fi || {
+            echo "    ERROR: failed to set LSEnvironment.$name" >&2
             return 1
         }
-    else
-        # Dict may already exist; tolerate either way.
-        /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist" \
-            2>/dev/null || true
-        /usr/libexec/PlistBuddy -c \
-            "Add :LSEnvironment:PYTHONNOUSERSITE string 1" "$plist" || {
-            echo "    ERROR: failed to add LSEnvironment.PYTHONNOUSERSITE" >&2
-            return 1
-        }
-    fi
-    echo "    Info.plist LSEnvironment.PYTHONNOUSERSITE = 1"
+        echo "    Info.plist LSEnvironment.$name = $value"
+    done
 }
 
 T_STEP=$SECONDS

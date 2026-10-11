@@ -34,7 +34,9 @@ CMAKE_KNOBS = SKIP_PYTHON_EXECUTABLE HIDE_SYMBOL SOLVCON_PROFILE \
 	LINT_AS_ERRORS USE_GOOGLETEST USE_SANITIZER USE_CCACHE USE_CTCACHE \
 	SOLVCON_DOC_WARNINGS_AS_ERRORS \
 	CMAKE_CUDA_ARCHITECTURES CMAKE_CUDA_HOST_COMPILER \
-	CMAKE_INSTALL_PREFIX CMAKE_LIBRARY_OUTPUT_DIRECTORY CMAKE_PREFIX_PATH
+	CMAKE_INSTALL_PREFIX CMAKE_LIBRARY_OUTPUT_DIRECTORY CMAKE_PREFIX_PATH \
+	CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET \
+	PYTHON_EXECUTABLE pybind11_DIR pybind11_path
 CMAKE_OVERRIDES = $(strip $(foreach knob,$(CMAKE_KNOBS), \
 	$(if $(filter-out undefined default,$(origin $(knob))),\
 	-D$(knob)=$($(knob)))))
@@ -72,6 +74,8 @@ FORCE_CLANG_FORMAT ?=
 RELEASE_OUTPUT ?= $(SOLVCON_ROOT)/build
 RELEASE_ARTIFACT ?= $(RELEASE_OUTPUT)/pilot.dmg
 RELEASE_DEPENDENCY_PREFIX ?=
+RELEASE_PYTHON_RUNTIME_ENV ?= $(SOLVCON_ROOT)/build/bundle-python-runtime
+RELEASE_PYTHON_BUILD_ENV ?= $(SOLVCON_ROOT)/build/bundle-python-build
 RELEASE_ARGS ?=
 
 # Let CMake find vcpkg-provided OpenBLAS/LAPACK headers, import libraries, and
@@ -241,15 +245,26 @@ run_pilot_pytest: pilot
 	env $(RUNENV) PYTEST_OPTS="$(PYTEST_OPTS)" \
 		cmake --build $(BUILD_PATH) --target $@ VERBOSE=$(VERBOSE)
 
+.PHONY: bundle-deps
+bundle-deps:
+	bash $(SOLVCON_ROOT)/contrib/bundle/prepare-python-deps.sh \
+		"$(RELEASE_DEPENDENCY_PREFIX)" \
+		"$(RELEASE_PYTHON_RUNTIME_ENV)" \
+		"$(RELEASE_PYTHON_BUILD_ENV)"
+
 .PHONY: bundle-precheck
 bundle-precheck:
 	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh check \
-		--dependency-prefix "$(RELEASE_DEPENDENCY_PREFIX)"
+		--dependency-prefix "$(RELEASE_DEPENDENCY_PREFIX)" \
+		--runtime-python-env "$(RELEASE_PYTHON_RUNTIME_ENV)" \
+		--build-python-env "$(RELEASE_PYTHON_BUILD_ENV)"
 
 .PHONY: bundle
 bundle:
 	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh all \
 		--dependency-prefix "$(RELEASE_DEPENDENCY_PREFIX)" \
+		--runtime-python-env "$(RELEASE_PYTHON_RUNTIME_ENV)" \
+		--build-python-env "$(RELEASE_PYTHON_BUILD_ENV)" \
 		--output "$(RELEASE_OUTPUT)" $(RELEASE_ARGS)
 
 .PHONY: bundle-test
