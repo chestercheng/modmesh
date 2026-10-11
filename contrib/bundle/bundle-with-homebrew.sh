@@ -230,22 +230,15 @@ bundle_pyver() {
     "$PYTHON" -s -c "import sys; print('%d.%d' % sys.version_info[:2])"
 }
 
-# Print every Mach-O under $1, NUL-delimited: standalone dylibs, .so
-# extensions, MacOS/ binaries, and the main binary of every nested framework.
-# Framework binaries cannot be matched by file mode -- Homebrew ships them as
-# 0644 -- so synthesise the canonical path (Versions/<v>/<name>) explicitly.
+# Print every Mach-O regular file under $1, NUL-delimited. Native helpers do
+# not consistently use a filename suffix or executable mode.
 list_macho() {
-    find "$1" -name '*.framework' -type d -print0 | \
-        while IFS= read -r -d '' fw; do
-            local nm ver bin
-            nm=$(basename "$fw" .framework)
-            for ver in "$fw"/Versions/*; do
-                [[ -d "$ver" && ! -L "$ver" ]] || continue
-                bin="$ver/$nm"
-                [[ -f "$bin" ]] && printf '%s\0' "$bin"
-            done
-        done
-    find "$1" -type f \( -name '*.dylib' -o -name '*.so' -o -path '*/MacOS/*' \) -print0
+    local f
+    while IFS= read -r -d '' f; do
+        if file -b "$f" 2>/dev/null | grep -q 'Mach-O'; then
+            printf '%s\0' "$f"
+        fi
+    done < <(find "$1" -type f -print0)
 }
 
 # Print every LC_RPATH entry of the Mach-O at $1, one per line.  `otool -L`
@@ -269,10 +262,104 @@ binary_rpaths() {
     '
 }
 
-# Verify the .app under $1 contains no non-system absolute load command,
-# install name, or rpath. Print offenders. Return 0 if clean and 1 otherwise.
+# Print the executable directory governing @executable_path for a Mach-O. The
+# nearest containing .app wins, which also handles nested helper applications.
+executable_dir_for_macho() {
+    local bin="$1" dir executable
+    dir=${bin%/*}
+    while [[ "$dir" == "$APP"/* || "$dir" == "$APP" ]]; do
+        if [[ "$dir" == *.app && -d "$dir/Contents/MacOS" ]]; then
+            executable=$(find "$dir/Contents/MacOS" -type f -print -quit)
+            [[ -n "$executable" ]] && dirname "$executable" && return 0
+        fi
+        [[ "$dir" == "$APP" ]] && break
+        dir=${dir%/*}
+    done
+    dirname "$BINARY"
+}
+
+expand_macho_path() {
+    local bin="$1" value="$2" root
+    case "$value" in
+    @loader_path) printf '%s\n' "${bin%/*}" ;;
+    @loader_path/*) printf '%s/%s\n' "${bin%/*}" "${value#@loader_path/}" ;;
+    @executable_path) executable_dir_for_macho "$bin" ;;
+    @executable_path/*)
+        root=$(executable_dir_for_macho "$bin")
+        printf '%s/%s\n' "$root" "${value#@executable_path/}"
+        ;;
+    /*) printf '%s\n' "$value" ;;
+    *) return 1 ;;
+    esac
+}
+
+# Resolve a tokenized load command against the bundle or dependency prefix.
+resolve_macho_load() {
+    local bin="$1" load="$2" allow_prefix="${3:-0}"
+    local rp root candidate suffix matches count source_bin
+    case "$load" in
+    @loader_path/*|@executable_path/*)
+        candidate=$(expand_macho_path "$bin" "$load")
+        if [[ -f "$candidate" ]]; then
+            printf '%s/%s\n' "$(cd "$(dirname "$candidate")" && pwd -P)" \
+                "$(basename "$candidate")"
+            return 0
+        fi
+        if [[ "$load" == @loader_path/* && -n "${SOURCE_MAP:-}" ]]; then
+            source_bin=$(awk -F '\t' -v bin="$bin" '$1 == bin { print $2; exit }' \
+                "$SOURCE_MAP")
+            if [[ -n "$source_bin" ]]; then
+                candidate="${source_bin%/*}/${load#@loader_path/}"
+                [[ -f "$candidate" ]] && printf '%s\n' "$candidate" && return 0
+            fi
+        fi
+        ;;
+    @rpath/*)
+        suffix=${load#@rpath/}
+        while IFS= read -r rp; do
+            root=$(expand_macho_path "$bin" "$rp" || true)
+            [[ -n "$root" ]] || continue
+            candidate="$root/$suffix"
+            if [[ -f "$candidate" ]]; then
+                printf '%s/%s\n' "$(cd "$(dirname "$candidate")" && pwd -P)" \
+                    "$(basename "$candidate")"
+                return 0
+            fi
+        done < <(binary_rpaths "$bin")
+
+        matches=$(find "$APP" -type f -path "*/$suffix" -print 2>/dev/null | \
+            while IFS= read -r candidate; do
+                printf '%s\n' "$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
+            done | sort -u)
+        count=$(printf '%s\n' "$matches" | grep -c . || true)
+        [[ $count -eq 1 ]] && printf '%s\n' "$matches" && return 0
+
+        if [[ "$allow_prefix" -eq 1 && -n "${DEPENDENCY_PREFIX:-}" ]]; then
+            matches=$(find "$DEPENDENCY_PREFIX" \( -type f -o -type l \) \
+                -path "*/$suffix" -print 2>/dev/null | while IFS= read -r candidate; do
+                    [[ -f "$candidate" ]] || continue
+                    printf '%s\n' "$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
+                done | sort -u)
+            count=$(printf '%s\n' "$matches" | grep -c . || true)
+            [[ $count -eq 1 ]] && printf '%s\n' "$matches" && return 0
+        fi
+        ;;
+    /*)
+        if [[ -f "$load" ]]; then
+            printf '%s/%s\n' "$(cd "$(dirname "$load")" && pwd -P)" \
+                "$(basename "$load")"
+            return 0
+        fi
+        ;;
+    esac
+    return 1
+}
+
+# Verify the .app under $1 contains no external load command, install name, or
+# rpath. Tokenized paths must resolve inside the app. Print offenders.
 check_self_contained() {
-    local total=0 bad=0 f load_refs install_id rpath_refs
+    local total=0 bad=0 f load_refs install_id rpath_refs token_refs
+    local token_rpath_refs load resolved rp expanded
     while IFS= read -r -d '' f; do
         total=$((total+1))
         load_refs=$(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' \
@@ -281,19 +368,96 @@ check_self_contained() {
             | grep -E '^/' | grep -Ev '^(/System/Library/|/usr/lib/)' || true)
         rpath_refs=$(binary_rpaths "$f" | grep -E '^/' \
             | grep -Ev '^(/System/Library/|/usr/lib/)' || true)
-        if [[ -n "$load_refs" || -n "$install_id" || -n "$rpath_refs" ]]; then
+        token_rpath_refs=""
+        while IFS= read -r rp; do
+            case "$rp" in @loader_path*|@executable_path*) ;; *) continue ;; esac
+            expanded=$(expand_macho_path "$f" "$rp" || true)
+            if [[ -d "$expanded" ]]; then
+                expanded=$(cd "$expanded" && pwd -P)
+            else
+                token_rpath_refs="${token_rpath_refs}${token_rpath_refs:+$'\n'}$rp"
+                continue
+            fi
+            case "$expanded" in
+            "$APP"/*) ;;
+            *) token_rpath_refs="${token_rpath_refs}${token_rpath_refs:+$'\n'}$rp" ;;
+            esac
+        done < <(binary_rpaths "$f")
+        token_refs=""
+        while IFS= read -r load; do
+            [[ -n "$load" ]] || continue
+            resolved=$(resolve_macho_load "$f" "$load" || true)
+            case "$resolved" in
+            "$APP"/*|/System/Library/*|/usr/lib/*) ;;
+            *) token_refs="${token_refs}${token_refs:+$'\n'}$load" ;;
+            esac
+        done < <(otool -L "$f" 2>/dev/null | awk 'NR>1 && $1 ~ /^@/ {print $1}')
+        if [[ -n "$load_refs" || -n "$install_id" || -n "$rpath_refs" || \
+                -n "$token_rpath_refs" || -n "$token_refs" ]]; then
             bad=$((bad+1))
             echo "    BAD: $f"
             [[ -n "$load_refs" ]] && echo "$load_refs" | sed 's/^/        load:  /'
             [[ -n "$install_id" ]] && echo "$install_id" | sed 's/^/        id:    /'
             [[ -n "$rpath_refs" ]] && echo "$rpath_refs" | sed 's/^/        rpath: /'
+            [[ -n "$token_rpath_refs" ]] && echo "$token_rpath_refs" | \
+                sed 's/^/        rpath: /'
+            [[ -n "$token_refs" ]] && echo "$token_refs" | sed 's/^/        token: /'
         fi
     done < <(list_macho "$1")
     if [[ $bad -eq 0 ]]; then
-        echo "    OK: $total Mach-O files have no non-system absolute references"
+        echo "    OK: $total Mach-O files resolve only inside the app or macOS"
         return 0
     fi
-    echo "ERROR: $bad of $total Mach-O files have non-system absolute references" >&2
+    echo "ERROR: $bad of $total Mach-O files have external references" >&2
+    return 1
+}
+
+check_macho_platform() {
+    local app="$1" total=0 bad=0 f minos found_minos
+    while IFS= read -r -d '' f; do
+        total=$((total+1))
+        found_minos=0
+        if ! lipo -verify_arch "$MACOS_ARCHITECTURES" "$f" \
+                >/dev/null 2>&1; then
+            echo "    BAD: $f has no $MACOS_ARCHITECTURES slice" >&2
+            bad=$((bad+1))
+        fi
+        while IFS= read -r minos; do
+            if ! awk -v actual="$minos" \
+                    -v maximum="$MACOS_DEPLOYMENT_TARGET" 'BEGIN {
+                split(actual, a, ".")
+                split(maximum, m, ".")
+                exit !((a[1] + 0 < m[1] + 0) ||
+                    (a[1] + 0 == m[1] + 0 && a[2] + 0 < m[2] + 0) ||
+                    (a[1] + 0 == m[1] + 0 && a[2] + 0 == m[2] + 0 &&
+                        a[3] + 0 <= m[3] + 0))
+            }'; then
+                echo "    BAD: $f requires macOS $minos" >&2
+                bad=$((bad+1))
+            fi
+            found_minos=1
+        done < <(otool -l "$f" 2>/dev/null | awk '
+            $1 == "cmd" {
+                wanted = ($2 == "LC_BUILD_VERSION" ||
+                    $2 == "LC_VERSION_MIN_MACOSX")
+                next
+            }
+            wanted && ($1 == "minos" || $1 == "version") {
+                print $2
+                wanted = 0
+            }
+        ')
+        if [[ $found_minos -eq 0 ]]; then
+            echo "    BAD: $f has no macOS deployment version" >&2
+            bad=$((bad+1))
+        fi
+    done < <(list_macho "$app")
+    if [[ $bad -eq 0 ]]; then
+        echo "    OK: $total Mach-O files support $MACOS_ARCHITECTURES" \
+            "and macOS $MACOS_DEPLOYMENT_TARGET"
+        return 0
+    fi
+    echo "ERROR: found $bad incompatible Mach-O platform entries" >&2
     return 1
 }
 
@@ -309,18 +473,46 @@ verify_app_structure() {
 }
 
 runtime_import_check() {
-    local bin="$1"
-    env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
-        PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
-        "$bin" --mode=python -c \
-        "import matplotlib; import solvcon.pilot._base_app"
+    local bin="$1" code
+    code='import importlib.metadata
+import pathlib
+import sys
+import fontTools
+import jsonschema
+import lz4.frame
+import matplotlib.pyplot
+import numpy
+import PIL.Image
+import PySide6
+import shiboken6
+import zstandard
+import solvcon.pilot.base._base_app
+jsonschema.validate({}, {})
+assert lz4.frame.decompress(lz4.frame.compress(b"pilot")) == b"pilot"
+compressed = zstandard.ZstdCompressor().compress(b"pilot")
+assert zstandard.ZstdDecompressor().decompress(compressed) == b"pilot"
+assert PIL.Image.new("RGB", (1, 1)).size == (1, 1)
+assert numpy.arange(3).sum() == 3
+for distribution in ("fonttools", "matplotlib", "jsonschema", "lz4", "Pillow", "zstandard"):
+    importlib.metadata.version(distribution)
+prefix = pathlib.Path(sys.prefix).resolve()
+for module in (fontTools, jsonschema, lz4, matplotlib, numpy, PIL, PySide6, shiboken6, solvcon, zstandard):
+    assert pathlib.Path(module.__file__).resolve().is_relative_to(prefix), module.__file__'
+    (
+        cd /
+        env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
+            PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
+            PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+            "$bin" --mode=python -c "$code"
+    )
 }
 
 smoke_launch_verify() {
-    local bin="$1" trace="$2" pid elapsed=0 loaded
+    local bin="$1" trace="$2" app="$3" pid elapsed=0 loaded bad_paths
     : > "$trace"
     env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
         PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
+        PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
         DYLD_PRINT_LIBRARIES=1 \
         "$bin" >/dev/null 2>"$trace" &
     pid=$!
@@ -339,12 +531,18 @@ smoke_launch_verify() {
         sed -n '1,80p' "$trace" >&2
         return 1
     fi
-    if grep -E '^dyld\[' "$trace" | grep -E '/opt/homebrew|/usr/local' >/dev/null; then
-        echo "ERROR: smoke launch loaded libraries from host package prefixes:" >&2
-        grep -E '^dyld\[' "$trace" | grep -E '/opt/homebrew|/usr/local' | head -20 >&2
+    bad_paths=$(grep -E '^dyld\[' "$trace" | awk '{print $NF}' | while IFS= read -r path; do
+        case "$path" in
+        "$app"/*|/System/Library/*|/usr/lib/*|/System/Volumes/Preboot/Cryptexes/OS/*) ;;
+        *) printf '%s\n' "$path" ;;
+        esac
+    done | sort -u)
+    if [[ -n "$bad_paths" ]]; then
+        echo "ERROR: smoke launch loaded libraries from outside the app or macOS:" >&2
+        echo "$bad_paths" | sed -n '1,20p' >&2
         return 1
     fi
-    echo "    OK: $loaded libraries loaded, none from host package prefixes"
+    echo "    OK: $loaded libraries loaded from the app or macOS"
 }
 
 VERIFY_MNT=""
@@ -383,6 +581,8 @@ verify_dmg() {
     app=$(find "$mnt" -maxdepth 2 -name '*.app' -type d -print -quit)
     [[ -n "$app" ]] || fail "no .app found in $dmg"
     bin="$app/Contents/MacOS/$(basename "$app" .app)"
+    APP="$app"
+    BINARY="$bin"
 
     note "Checking mounted app structure"
     verify_app_structure "$app"
@@ -392,8 +592,11 @@ verify_dmg() {
     spctl --assess --type execute --verbose=4 "$app" 2>&1 || \
         echo "    warning: spctl rejected this app (expected for ad-hoc signed prototype builds)"
 
-    note "Static scan for host package paths"
+    note "Static scan for external Mach-O paths"
     check_self_contained "$app"
+
+    note "Checking Mach-O architecture and deployment versions"
+    check_macho_platform "$app"
 
     note "Runtime import check from a writable app copy"
     cp -R "$app" "$tmp/"
@@ -409,7 +612,7 @@ verify_dmg() {
     codesign --verify --deep --strict "$copied_app"
 
     note "Smoke launch from mounted DMG"
-    smoke_launch_verify "$bin" "$trace"
+    smoke_launch_verify "$bin" "$trace" "$app"
 
     note "Release artifact verification passed"
 }
@@ -773,31 +976,114 @@ echo "    [Step 5.5 (Pre-compile bytecode): $((SECONDS - T_STEP))s]"
 # LC_ID_DYLIB to the bundled copy, and strip the source prefix from LC_RPATH.
 # ---------------------------------------------------------------------------
 
-# BFS-walk every Mach-O in the bundle: pop one, copy any missing prefix
-# dependency into Contents/Frameworks/, enqueue what we just copied. Touching
-# each file once keeps cost linear in bundle size. Sets the global SEEN_DYLIB /
-# SEEN_FW indexes consumed by rewrite_load_commands below.
+bundle_load_path() {
+    local bin="$1" target="$2" rel
+    rel=$("$PYTHON" -c \
+        'import os, sys; print(os.path.relpath(sys.argv[2], os.path.dirname(sys.argv[1])))' \
+        "$bin" "$target")
+    printf '@loader_path/%s\n' "$rel"
+}
+
+record_missing_load() {
+    local bin="$1" load="$2"
+    if ! grep -qxF "$bin -> $load" "$SEEN_MISSING"; then
+        printf '%s -> %s\n' "$bin" "$load" >> "$SEEN_MISSING"
+        echo "    ERROR: could not resolve $load loaded by $bin" >&2
+    fi
+}
+
+same_macho_identity() {
+    local left="$1" right="$2" left_uuid right_uuid
+    left_uuid=$(otool -l "$left" | awk '$1 == "uuid" { print $2 }')
+    right_uuid=$(otool -l "$right" | awk '$1 == "uuid" { print $2 }')
+    [[ -n "$left_uuid" && "$left_uuid" == "$right_uuid" ]]
+}
+
+copy_dependency_dylib() {
+    local source="$1" base destination known
+    base=${source##*/}
+    destination="$FW_DIR/$base"
+    known=$(awk -F '\t' -v base="$base" '$1 == base { print $2; exit }' \
+        "$DYLIB_SOURCES")
+    if [[ -n "$known" && "$known" != "$source" ]]; then
+        echo "ERROR: dynamic library name collision for $base:" >&2
+        echo "    $known" >&2
+        echo "    $source" >&2
+        return 1
+    fi
+    if [[ -f "$destination" && -z "$known" ]]; then
+        if same_macho_identity "$source" "$destination"; then
+            printf '%s\t%s\n' "$base" "$source" >> "$DYLIB_SOURCES"
+            printf '%s\t%s\n' "$destination" "$source" >> "$SOURCE_MAP"
+        else
+            echo "ERROR: $source collides with bundled $destination" >&2
+            return 1
+        fi
+    fi
+    if [[ ! -f "$destination" ]]; then
+        cp -L "$source" "$destination" || return 1
+        chmod u+w "$destination"
+        printf '%s\t%s\n' "$base" "$source" >> "$DYLIB_SOURCES"
+        printf '%s\t%s\n' "$destination" "$source" >> "$SOURCE_MAP"
+        echo "$destination" >> "$QUEUE"
+    fi
+    printf '%s\n' "$destination"
+}
+
+copy_dependency_framework() {
+    local source="$1" source_fw name destination target relative known src_bin
+    source_fw=${source%%.framework/*}.framework
+    name=$(basename "$source_fw" .framework)
+    destination="$FW_DIR/$name.framework"
+    relative=${source#"$source_fw"/}
+    known=$(awk -F '\t' -v name="$name" '$1 == name { print $2; exit }' \
+        "$FRAMEWORK_SOURCES")
+    if [[ -n "$known" && "$known" != "$source_fw" ]]; then
+        echo "ERROR: framework name collision for $name.framework:" >&2
+        echo "    $known" >&2
+        echo "    $source_fw" >&2
+        return 1
+    fi
+    if [[ -d "$destination" && -z "$known" ]]; then
+        target="$destination/$relative"
+        if same_macho_identity "$source" "$target"; then
+            printf '%s\t%s\n' "$name" "$source_fw" >> "$FRAMEWORK_SOURCES"
+        else
+            echo "ERROR: $source_fw collides with bundled $destination" >&2
+            return 1
+        fi
+    fi
+    if [[ ! -d "$destination" ]]; then
+        mkdir -p "$destination"
+        rsync -a --copy-unsafe-links "$source_fw/" "$destination/" || return 1
+        chmod -R u+w "$destination"
+        printf '%s\t%s\n' "$name" "$source_fw" >> "$FRAMEWORK_SOURCES"
+        while IFS= read -r -d '' src_bin; do
+            target="$destination/${src_bin#"$source_fw"/}"
+            printf '%s\t%s\n' "$target" "$src_bin" >> "$SOURCE_MAP"
+            echo "$target" >> "$QUEUE"
+        done < <(list_macho "$source_fw")
+    fi
+    printf '%s/%s\n' "$destination" "$relative"
+}
+
+# Walk every dependency edge. Prefix dependencies are copied into the bundle,
+# and each edge records the exact replacement load command.
 vendor_native_deps() {
     CLOSURE_TMP=$(mktemp -d)
     QUEUE="$CLOSURE_TMP/queue"
     SEEN_BIN="$CLOSURE_TMP/seen_bin"
-    SEEN_DYLIB="$CLOSURE_TMP/seen_dylib"
-    SEEN_FW="$CLOSURE_TMP/seen_fw"
     SEEN_MISSING="$CLOSURE_TMP/seen_missing"
-    touch "$QUEUE" "$SEEN_BIN" "$SEEN_DYLIB" "$SEEN_FW" "$SEEN_MISSING"
-
-    # Skip what's already in Contents/Frameworks/.
-    local f
-    for f in "$FW_DIR"/*.dylib; do
-        [[ -f "$f" ]] && basename "$f" >> "$SEEN_DYLIB"
-    done
-    for f in "$FW_DIR"/*.framework; do
-        [[ -d "$f" ]] && basename "$f" .framework >> "$SEEN_FW"
-    done
+    REWRITE_EDGES="$CLOSURE_TMP/rewrite_edges"
+    SOURCE_MAP="$CLOSURE_TMP/source_map"
+    DYLIB_SOURCES="$CLOSURE_TMP/dylib_sources"
+    FRAMEWORK_SOURCES="$CLOSURE_TMP/framework_sources"
+    touch "$QUEUE" "$SEEN_BIN" "$SEEN_MISSING" "$REWRITE_EDGES" \
+        "$SOURCE_MAP" "$DYLIB_SOURCES" "$FRAMEWORK_SOURCES"
 
     list_macho "$APP" | xargs -0 -n1 echo >> "$QUEUE"
 
-    local BIN OLD fw SRC base cand
+    local BIN OLD SRC TARGET NEW resolved
     while [[ -s "$QUEUE" ]]; do
         BIN=$(head -n 1 "$QUEUE")
         sed -i '' '1d' "$QUEUE"
@@ -805,82 +1091,37 @@ vendor_native_deps() {
         echo "$BIN" >> "$SEEN_BIN"
         while IFS= read -r OLD; do
             case "$OLD" in
-            "$DEPENDENCY_PREFIX"/*.framework/Versions/*/*)
-                fw=${OLD##*/}
-                grep -qxF "$fw" "$SEEN_FW" && continue
-                SRC=${OLD%%/Versions/*}
-                if [[ ! -d "$SRC" ]]; then
-                    if ! grep -qxF "$OLD" "$SEEN_MISSING"; then
-                        echo "$OLD" >> "$SEEN_MISSING"
-                        echo "    ERROR: missing source $OLD" >&2
-                    fi
+            /System/Library/*|/usr/lib/*|"$APP"/*) continue ;;
+            "$DEPENDENCY_PREFIX"/*) SRC="$OLD" ;;
+            @loader_path/*|@executable_path/*|@rpath/*)
+                resolved=$(resolve_macho_load "$BIN" "$OLD" 1 || true)
+                case "$resolved" in
+                "$APP"/*)
+                    NEW=$(bundle_load_path "$BIN" "$resolved")
+                    printf '%s\t%s\t%s\n' "$BIN" "$OLD" "$NEW" >> "$REWRITE_EDGES"
                     continue
-                fi
-                # Preserve internal symlinks but materialise Cellar- bound ones
-                # (the binary itself), keeping the framework's on-disk shape
-                # intact.
-                mkdir -p "$FW_DIR/$fw.framework"
-                if rsync -a --copy-unsafe-links \
-                        "$SRC/" "$FW_DIR/$fw.framework/" 2>/dev/null; then
-                    chmod -R u+w "$FW_DIR/$fw.framework"
-                    echo "$fw" >> "$SEEN_FW"
-                    list_macho "$FW_DIR/$fw.framework" \
-                        | xargs -0 -n1 echo >> "$QUEUE"
-                else
-                    echo "ERROR: could not copy framework $SRC" >&2
-                    return 1
-                fi
+                    ;;
+                /System/Library/*|/usr/lib/*) continue ;;
+                "$DEPENDENCY_PREFIX"/*) SRC="$resolved" ;;
+                *) record_missing_load "$BIN" "$OLD"; continue ;;
+                esac
                 ;;
-            "$DEPENDENCY_PREFIX"/*)
-                base=${OLD##*/}
-                grep -qxF "$base" "$SEEN_DYLIB" && continue
-                if [[ ! -f "$OLD" ]]; then
-                    if ! grep -qxF "$OLD" "$SEEN_MISSING"; then
-                        echo "$OLD" >> "$SEEN_MISSING"
-                        echo "    ERROR: missing source $OLD" >&2
-                    fi
-                    continue
-                fi
-                if cp -L "$OLD" "$FW_DIR/$base" 2>/dev/null; then
-                    chmod u+w "$FW_DIR/$base"
-                    echo "$base" >> "$SEEN_DYLIB"
-                    echo "$FW_DIR/$base" >> "$QUEUE"
-                else
-                    echo "ERROR: could not copy dynamic library $OLD" >&2
-                    return 1
-                fi
-                ;;
-            @rpath/lib*.dylib)
-                # Sibling references like libgfortran -> @rpath/
-                # libgcc_s.1.1.dylib, where Homebrew ships the sibling next to
-                # the loader under one of its keg paths.
-                base=${OLD##*/}
-                grep -qxF "$base" "$SEEN_DYLIB" && continue
-                SRC=""
-                for cand in \
-                    "$DEPENDENCY_PREFIX/lib/$base" \
-                    "$DEPENDENCY_PREFIX"/opt/*/lib/"$base" \
-                    "$DEPENDENCY_PREFIX"/opt/*/lib/gcc/current/"$base"
-                do
-                    [[ -f "$cand" ]] && { SRC="$cand"; break; }
-                done
-                if [[ -z "$SRC" ]]; then
-                    if ! grep -qxF "$OLD" "$SEEN_MISSING"; then
-                        echo "$OLD" >> "$SEEN_MISSING"
-                        echo "    WARN: could not resolve $OLD under $DEPENDENCY_PREFIX" >&2
-                    fi
-                    continue
-                fi
-                if cp -L "$SRC" "$FW_DIR/$base" 2>/dev/null; then
-                    chmod u+w "$FW_DIR/$base"
-                    echo "$base" >> "$SEEN_DYLIB"
-                    echo "$FW_DIR/$base" >> "$QUEUE"
-                else
-                    echo "ERROR: could not copy dynamic library $SRC" >&2
-                    return 1
-                fi
-                ;;
+            /*|@*) record_missing_load "$BIN" "$OLD"; continue ;;
+            *) continue ;;
             esac
+
+            if [[ ! -f "$SRC" ]]; then
+                record_missing_load "$BIN" "$OLD"
+                continue
+            fi
+            SRC=$("$PYTHON" -c \
+                'import os, sys; print(os.path.realpath(sys.argv[1]))' "$SRC")
+            case "$SRC" in
+            *.framework/*) TARGET=$(copy_dependency_framework "$SRC") || return 1 ;;
+            *) TARGET=$(copy_dependency_dylib "$SRC") || return 1 ;;
+            esac
+            NEW=$(bundle_load_path "$BIN" "$TARGET")
+            printf '%s\t%s\t%s\n' "$BIN" "$OLD" "$NEW" >> "$REWRITE_EDGES"
         done < <(otool -L "$BIN" 2>/dev/null | awk 'NR>1 {print $1}')
     done
 
@@ -889,53 +1130,16 @@ vendor_native_deps() {
         return 1
     fi
 
-    echo "    bundled $(wc -l < "$SEEN_DYLIB" | tr -d ' ') dylibs and \
-$(wc -l < "$SEEN_FW" | tr -d ' ') frameworks"
+    echo "    bundled $(wc -l < "$DYLIB_SOURCES" | tr -d ' ') dylibs and \
+$(wc -l < "$FRAMEWORK_SOURCES" | tr -d ' ') frameworks"
 }
 
-# Rewrite every Mach-O reference whose target is now bundled (load commands,
-# LC_ID_DYLIB, and the two Python re-export stubs that hard-code the original
-# Python path). Reads SEEN_DYLIB / SEEN_FW populated by vendor_native_deps.
 rewrite_load_commands() {
-    # Surrounding spaces let bash do containment with the *" $tok "* glob.
-    local INDEX FW_INDEX
-    INDEX=" $(tr '\n' ' ' < "$SEEN_DYLIB")"
-    FW_INDEX=" $(tr '\n' ' ' < "$SEEN_FW")"
+    local BIN OLD NEW f fw_path name vname bin_path VER python_target
+    while IFS=$'\t' read -r BIN OLD NEW; do
+        install_name_tool -change "$OLD" "$NEW" "$BIN"
+    done < "$REWRITE_EDGES"
 
-    local BIN OLD fw ver base NEW
-    while IFS= read -r -d '' BIN; do
-        while IFS= read -r OLD; do
-            case "$OLD" in
-            "$DEPENDENCY_PREFIX"/*.framework/Versions/*/*)
-                fw=${OLD##*/}
-                if [[ "$FW_INDEX" == *" $fw "* ]]; then
-                    # Preserve the original version segment.
-                    ver=${OLD#*.framework/Versions/}; ver=${ver%%/*}
-                    NEW="@executable_path/../Frameworks/${fw}.framework/Versions/${ver}/${fw}"
-                    install_name_tool -change "$OLD" "$NEW" "$BIN"
-                fi
-                ;;
-            "$DEPENDENCY_PREFIX"/*)
-                base=${OLD##*/}
-                if [[ "$INDEX" == *" $base "* ]]; then
-                    NEW="@executable_path/../Frameworks/$base"
-                    install_name_tool -change "$OLD" "$NEW" "$BIN"
-                fi
-                ;;
-            @rpath/lib*.dylib)
-                base=${OLD##*/}
-                if [[ "$INDEX" == *" $base "* ]]; then
-                    NEW="@executable_path/../Frameworks/$base"
-                    install_name_tool -change "$OLD" "$NEW" "$BIN"
-                fi
-                ;;
-            esac
-        done < <(otool -L "$BIN" 2>/dev/null | awk 'NR>1 {print $1}')
-    done < <(list_macho "$APP")
-
-    # Each bundled dylib/framework's own LC_ID_DYLIB still names its original
-    # source path; rewrite so dyld dedupes by install name.
-    local f fw_path name vname bin_path VER
     while IFS= read -r -d '' f; do
         case "$f" in
             *.dylib) install_name_tool -id "@loader_path/$(basename "$f")" "$f" ;;
@@ -943,9 +1147,7 @@ rewrite_load_commands() {
     done < <(list_macho "$APP")
     for f in "$FW_DIR"/*.dylib; do
         [[ -f "$f" ]] || continue
-        install_name_tool -id \
-            "@executable_path/../Frameworks/$(basename "$f")" "$f" \
-            2>/dev/null
+        install_name_tool -id "@loader_path/$(basename "$f")" "$f" 2>/dev/null
     done
     for fw_path in "$FW_DIR"/*.framework; do
         [[ -d "$fw_path" ]] || continue
@@ -955,37 +1157,35 @@ rewrite_load_commands() {
             bin_path="$VER/$name"
             [[ -f "$bin_path" ]] || continue
             vname=$(basename "$VER")
-            install_name_tool -id \
-                "@executable_path/../Frameworks/${name}.framework/Versions/${vname}/${name}" \
-                "$bin_path" 2>/dev/null
+            install_name_tool -id "@loader_path/$name" "$bin_path" 2>/dev/null
         done
     done
 
     # Two re-export stubs inside Python.framework still hard-code the original
     # Homebrew Python path. Redirect them to the bundled copy.
+    python_target="$DEST_FW/Versions/$PY_VER/Python"
     for f in \
         "$DEST_FW/Versions/$PY_VER/lib/libpython${PY_VER}.dylib" \
         "$DEST_FW/Versions/$PY_VER/lib/python${PY_VER}/config-${PY_VER}-darwin/libpython${PY_VER}.dylib"
     do
         [[ -f "$f" ]] || continue
-        install_name_tool -change "$PY_DYLIB" "$NEW_PY_PATH" "$f" 2>/dev/null || true
+        if otool -L "$f" | awk 'NR>1 {print $1}' | grep -qxF "$PY_DYLIB"; then
+            NEW=$(bundle_load_path "$f" "$python_target")
+            install_name_tool -change "$PY_DYLIB" "$NEW" "$f"
+        fi
     done
 }
 
-# LC_RPATH is invisible to otool -L so the rewrite above missed it. A surviving
-# source rpath silently falls back to the build host and fails everywhere else.
-# For each affected Mach-O: add
-# @executable_path/../Frameworks (so bundled siblings stay reachable via
-# @rpath/), then delete every source-prefix entry one at a time
-# (install_name_tool removes one per call).
+# Delete source-prefix rpaths. Add a loader-relative path to the bundle's
+# Frameworks directory so the rule also works for nested helper applications.
 strip_dependency_rpaths() {
-    local EP_RPATH='@executable_path/../Frameworks'
-    local BIN dependency_rps rp
+    local BIN dependency_rps rp replacement
     while IFS= read -r -d '' BIN; do
         dependency_rps=$(binary_rpaths "$BIN" | grep -F "$DEPENDENCY_PREFIX/" || true)
         [[ -z "$dependency_rps" ]] && continue
-        if ! binary_rpaths "$BIN" | grep -qxF "$EP_RPATH"; then
-            install_name_tool -add_rpath "$EP_RPATH" "$BIN"
+        replacement=$(bundle_load_path "$BIN" "$FW_DIR")
+        if ! binary_rpaths "$BIN" | grep -qxF "$replacement"; then
+            install_name_tool -add_rpath "$replacement" "$BIN"
         fi
         while IFS= read -r rp; do
             [[ -z "$rp" ]] && continue
@@ -1058,8 +1258,8 @@ echo "==> Stripping dependency-prefix rpaths"
 strip_dependency_rpaths
 echo "==> Deduplicating PySide6's bundled Qt against the main bundle Qt"
 dedupe_pyside_qt
-echo "==> Setting PYTHONNOUSERSITE=1 in Info.plist"
-inject_pythonnousersite
+echo "==> Setting the embedded Python environment in Info.plist"
+inject_python_environment
 echo "==> Checking rewritten native dependency paths"
 check_self_contained "$APP"
 echo "    [Step 6 (Vendor native deps): $((SECONDS - T_STEP))s]"
@@ -1077,8 +1277,8 @@ echo "    [Step 6 (Vendor native deps): $((SECONDS - T_STEP))s]"
 sign_inner_machos() {
     local BIN
     while IFS= read -r -d '' BIN; do
-        codesign --force --sign - "$BIN" 2>/dev/null || true
-    done < <(find "$APP/Contents" \( -name '*.dylib' -o -name '*.so' \) -print0)
+        codesign --force --sign - "$BIN"
+    done < <(list_macho "$APP/Contents")
 }
 
 # Sign nested helper apps (e.g. QtWebEngineCore's QtWebEngineProcess.app)
@@ -1090,7 +1290,7 @@ sign_helper_apps() {
         sort -k1,1nr | cut -d' ' -f2- | while IFS= read -r INNER_APP; do
         [[ "$INNER_APP" == "$APP" ]] && continue
         rm -rf "$INNER_APP/Contents/_CodeSignature"
-        codesign --force --sign - "$INNER_APP" 2>/dev/null || true
+        codesign --force --sign - "$INNER_APP"
     done
 }
 
@@ -1098,12 +1298,13 @@ sign_helper_apps() {
 # On macOS the framework version directory carries the signature.
 sign_frameworks() {
     local FW VER
-    for FW in "$FW_DIR"/*.framework; do
-        [[ -d "$FW" ]] || continue
+    find "$APP" -name '*.framework' -type d -print | \
+        awk '{print length($0), $0}' | sort -k1,1nr | cut -d' ' -f2- | \
+        while IFS= read -r FW; do
         for VER in "$FW"/Versions/*; do
             [[ -d "$VER" && ! -L "$VER" ]] || continue
             rm -rf "$VER/_CodeSignature"
-            codesign --force --sign - "$VER" 2>/dev/null || true
+            codesign --force --sign - "$VER"
         done
     done
 }
@@ -1112,6 +1313,7 @@ sign_frameworks() {
 sign_main_app() {
     codesign --force --sign - "$BINARY"
     codesign --force --sign - "$APP"
+    codesign --verify --deep --strict "$APP"
 }
 
 T_STEP=$SECONDS
@@ -1148,8 +1350,8 @@ echo "DMG complete: $DMG ($SIZE)"
 # Step 9: Verify hermeticity
 #
 # Two complementary checks per artifact:
-#   - Static scan of every Mach-O load command and LC_RPATH for any
-#     surviving Homebrew prefix reference.
+#   - Static scan of every Mach-O load command and LC_RPATH for references
+#     outside the app and macOS system locations.
 #   - Smoke launch under env -i with DYLD_PRINT_LIBRARIES=1 to catch
 #     anything that resolves at runtime via PATH or dyld fallbacks.
 # Repeated for both the .app and the .app inside the mounted DMG.
@@ -1169,6 +1371,7 @@ launch_and_trace() {
     : > "$TRACE"
     env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
         PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
+        PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
         DYLD_PRINT_LIBRARIES=1 \
         "$bin" >/dev/null 2>"$TRACE" &
     pid=$!
@@ -1182,28 +1385,32 @@ launch_and_trace() {
     wait "$pid" 2>/dev/null || true
 }
 
-# Run a sandboxed launch and verify the dyld trace: enough loads happened, none
-# from host Homebrew prefixes.
+# Run a sandboxed launch and verify the dyld trace: enough loads happened, and
+# every load came from the app or macOS.
 smoke_check() {
-    local bin="$1" label="${2:-}" total brew_count
+    local bin="$1" app="$2" label="${3:-}" total bad_paths
     [[ -n "$label" ]] && label=" ($label)"
     echo "==> Smoke launch${label} under sandboxed env (DYLD_PRINT_LIBRARIES=1)"
     launch_and_trace "$bin"
     total=$(grep -c '^dyld\[' "$TRACE" || true)
-    brew_count=$(grep -E '^dyld\[' "$TRACE" | grep -E -c '/opt/homebrew|/usr/local' || true)
+    bad_paths=$(grep -E '^dyld\[' "$TRACE" | awk '{print $NF}' | while IFS= read -r path; do
+        case "$path" in
+        "$app"/*|/System/Library/*|/usr/lib/*|/System/Volumes/Preboot/Cryptexes/OS/*) ;;
+        *) printf '%s\n' "$path" ;;
+        esac
+    done | sort -u)
     if [[ $total -lt $MIN_LOADS ]]; then
         echo "ERROR: pilot loaded only $total libraries (expected >= $MIN_LOADS);" \
              "did it crash early?" >&2
         sed -n '1,40p' "$TRACE" >&2
         exit 1
     fi
-    if [[ $brew_count -gt 0 ]]; then
-        echo "ERROR: $brew_count of $total dyld loads came from host package prefixes:" >&2
-        grep -E '^dyld\[' "$TRACE" | grep -E '/opt/homebrew|/usr/local' | head -10 \
-            | sed 's/^/    /' >&2
+    if [[ -n "$bad_paths" ]]; then
+        echo "ERROR: dyld loaded libraries from outside the app or macOS:" >&2
+        echo "$bad_paths" | sed -n '1,20p' >&2
         exit 1
     fi
-    echo "    OK: $total libraries loaded, none from host package prefixes"
+    echo "    OK: $total libraries loaded from the app or macOS"
 }
 
 # Run Step 9 against both the .app and the .app inside the mounted DMG. TRACE
@@ -1215,9 +1422,11 @@ if [[ $SKIP_CHECK -eq 0 ]]; then
 
     echo ""
     echo "==> Checking $APP"
-    echo "==> Static scan for host package path references"
+    echo "==> Static scan for external Mach-O paths"
     check_self_contained "$APP"
-    smoke_check "$BINARY"
+    echo "==> Checking Mach-O architecture and deployment versions"
+    check_macho_platform "$APP"
+    smoke_check "$BINARY" "$APP"
     echo ""
     echo "Bundle check passed: $APP"
 
@@ -1230,10 +1439,16 @@ if [[ $SKIP_CHECK -eq 0 ]]; then
     DMG_APP=$(find "$DMG_MOUNT" -maxdepth 2 -name '*.app' -type d -print -quit)
     [[ -n "$DMG_APP" ]] || { echo "ERROR: no .app found in $DMG" >&2; exit 1; }
     echo "==> Found app: $DMG_APP"
-    echo "==> Static scan (DMG) for host package path references"
-    check_self_contained "$DMG_APP"
     DMG_BINARY="$DMG_APP/Contents/MacOS/$(basename "$DMG_APP" .app)"
-    smoke_check "$DMG_BINARY" "DMG"
+    APP="$DMG_APP"
+    BINARY="$DMG_BINARY"
+    echo "==> Static scan (DMG) for external Mach-O paths"
+    check_self_contained "$DMG_APP"
+    echo "==> Checking Mach-O architecture and deployment versions (DMG)"
+    check_macho_platform "$DMG_APP"
+    echo "==> Runtime import check (DMG)"
+    runtime_import_check "$DMG_BINARY"
+    smoke_check "$DMG_BINARY" "$DMG_APP" "DMG"
     echo ""
     echo "DMG check passed: $DMG"
     echo "    [Step 9 (Verify hermeticity): $((SECONDS - T_STEP))s]"
