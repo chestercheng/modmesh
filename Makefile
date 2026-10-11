@@ -71,6 +71,7 @@ VERBOSE ?=
 FORCE_CLANG_FORMAT ?=
 RELEASE_OUTPUT ?= $(SOLVCON_ROOT)/build
 RELEASE_ARTIFACT ?= $(RELEASE_OUTPUT)/pilot.dmg
+RELEASE_DEPENDENCY_PREFIX ?=
 RELEASE_ARGS ?=
 
 # Let CMake find vcpkg-provided OpenBLAS/LAPACK headers, import libraries, and
@@ -242,11 +243,13 @@ run_pilot_pytest: pilot
 
 .PHONY: bundle-precheck
 bundle-precheck:
-	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh check
+	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh check \
+		--dependency-prefix "$(RELEASE_DEPENDENCY_PREFIX)"
 
 .PHONY: bundle
 bundle:
 	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh all \
+		--dependency-prefix "$(RELEASE_DEPENDENCY_PREFIX)" \
 		--output "$(RELEASE_OUTPUT)" $(RELEASE_ARGS)
 
 .PHONY: bundle-test
