@@ -72,6 +72,8 @@ FORCE_CLANG_FORMAT ?=
 RELEASE_OUTPUT ?= $(SOLVCON_ROOT)/build
 RELEASE_ARTIFACT ?= $(RELEASE_OUTPUT)/pilot.dmg
 RELEASE_ARGS ?=
+RELEASE_PREFIX ?=
+RELEASE_PREFIX_ARGS = $(if $(strip $(RELEASE_PREFIX)),--prefix "$(RELEASE_PREFIX)")
 
 # Let CMake find vcpkg-provided OpenBLAS/LAPACK headers, import libraries, and
 # package metadata during configure and link on Windows.
@@ -240,19 +242,26 @@ run_pilot_pytest: pilot
 	env $(RUNENV) PYTEST_OPTS="$(PYTEST_OPTS)" \
 		cmake --build $(BUILD_PATH) --target $@ VERBOSE=$(VERBOSE)
 
+.PHONY: bundle-prepare
+bundle-prepare:
+	"$(SOLVCON_ROOT)/contrib/bundle/bundle-with-prefix.sh" prepare \
+		$(RELEASE_PREFIX_ARGS) $(RELEASE_ARGS)
+
 .PHONY: bundle-precheck
 bundle-precheck:
-	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh check
+	"$(SOLVCON_ROOT)/contrib/bundle/bundle-with-prefix.sh" check \
+		$(RELEASE_PREFIX_ARGS)
 
 .PHONY: bundle
 bundle:
-	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh all \
+	"$(SOLVCON_ROOT)/contrib/bundle/bundle-with-prefix.sh" all \
+		$(RELEASE_PREFIX_ARGS) \
 		--output "$(RELEASE_OUTPUT)" $(RELEASE_ARGS)
 
 .PHONY: bundle-test
 bundle-test:
-	$(SOLVCON_ROOT)/contrib/bundle/bundle-with-homebrew.sh verify \
-		"$(RELEASE_ARTIFACT)"
+	"$(SOLVCON_ROOT)/contrib/bundle/bundle-with-prefix.sh" verify \
+		"$(RELEASE_ARTIFACT)" $(RELEASE_PREFIX_ARGS)
 
 .PHONY: standalone_buffer_setup
 standalone_buffer_setup:

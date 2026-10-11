@@ -26,6 +26,26 @@ find_package(Qt6 COMPONENTS Svg)
 find_package(Qt6 QUIET OPTIONAL_COMPONENTS GuiPrivate)
 
 if(APPLE)
+    set(PILOT_BUNDLE_IDENTIFIER "net.solvcon.pilot" CACHE STRING
+        "macOS bundle identifier for pilot")
+    set(PILOT_BUNDLE_VERSION "0.0.0" CACHE STRING
+        "macOS bundle version for pilot")
+    set(PILOT_BUNDLE_BUILD_VERSION "1" CACHE STRING
+        "macOS bundle build version for pilot")
+    set(PILOT_BUNDLE_CATEGORY "public.app-category.developer-tools" CACHE STRING
+        "macOS App Store category for pilot")
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(PILOT_MINIMUM_MACOS_VERSION "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    else()
+        set(PILOT_MINIMUM_MACOS_VERSION "15.0")
+    endif()
+
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in
+        ${CMAKE_CURRENT_BINARY_DIR}/Info.plist
+        @ONLY
+    )
+
     set(MACOSX_BUNDLE_ICON_FILE solvcon.icns)
     set(app_icon_macos ${PROJECT_ROOT_DIR}/resources/pilot/solvcon.icns)
     set_source_files_properties(${app_icon_macos} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
@@ -106,6 +126,7 @@ set_target_properties(
     pilot PROPERTIES
     WIN32_EXECUTABLE TRUE
     MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist
 )
 
 if(APPLE)
