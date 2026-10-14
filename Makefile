@@ -73,7 +73,9 @@ RELEASE_OUTPUT ?= $(SOLVCON_ROOT)/build
 RELEASE_ARTIFACT ?= $(RELEASE_OUTPUT)/pilot.dmg
 RELEASE_ARGS ?=
 RELEASE_PREFIX ?=
+RELEASE_TOOLS_PREFIX ?=
 RELEASE_PREFIX_ARGS = $(if $(strip $(RELEASE_PREFIX)),--prefix "$(RELEASE_PREFIX)")
+RELEASE_TOOLS_ARGS = $(if $(strip $(RELEASE_TOOLS_PREFIX)),--tools-prefix "$(RELEASE_TOOLS_PREFIX)")
 
 # Let CMake find vcpkg-provided OpenBLAS/LAPACK headers, import libraries, and
 # package metadata during configure and link on Windows.
@@ -245,17 +247,17 @@ run_pilot_pytest: pilot
 .PHONY: bundle-prepare
 bundle-prepare:
 	"$(SOLVCON_ROOT)/contrib/bundle/bundle-with-prefix.sh" prepare \
-		$(RELEASE_PREFIX_ARGS) $(RELEASE_ARGS)
+		$(RELEASE_PREFIX_ARGS) $(RELEASE_TOOLS_ARGS) $(RELEASE_ARGS)
 
 .PHONY: bundle-precheck
 bundle-precheck:
 	"$(SOLVCON_ROOT)/contrib/bundle/bundle-with-prefix.sh" check \
-		$(RELEASE_PREFIX_ARGS)
+		$(RELEASE_PREFIX_ARGS) $(RELEASE_TOOLS_ARGS)
 
 .PHONY: bundle
 bundle:
 	"$(SOLVCON_ROOT)/contrib/bundle/bundle-with-prefix.sh" all \
-		$(RELEASE_PREFIX_ARGS) \
+		$(RELEASE_PREFIX_ARGS) $(RELEASE_TOOLS_ARGS) \
 		--output "$(RELEASE_OUTPUT)" $(RELEASE_ARGS)
 
 .PHONY: bundle-test

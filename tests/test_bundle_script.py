@@ -72,11 +72,15 @@ esac
     def test_help(self):
         result = self._run('--help')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('prepare [--prefix DIR] [--dry-run]', result.stdout)
+        self.assertIn('prepare [--prefix DIR] [--tools-prefix DIR]',
+                      result.stdout)
 
     def test_invalid_options(self):
         for args in (('check', '--prefix'), ('check', '--prefix', ''),
                      ('check', '--prefix', '/'),
+                     ('check', '--tools-prefix'),
+                     ('check', '--tools-prefix', '/'),
+                     ('verify', 'artifact.dmg', '--tools-prefix', 'tools'),
                      ('check', '--dry-run'), ('verify',),
                      ('prepare', '--skip-build')):
             with self.subTest(args=args):
@@ -99,18 +103,25 @@ case "$1" in
 esac
 ''')
         prefix = 'deps with spaces/6.11.1/macos'
-        result = self._run('prepare', '--prefix', prefix, '--dry-run')
+        tools = 'tools with spaces'
+        result = self._run('prepare', '--prefix', prefix,
+                           '--tools-prefix', tools, '--dry-run')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(self.root / prefix), result.stdout)
+        self.assertIn(str(self.root / tools), result.stdout)
+        self.assertIn('install runtime packages', result.stdout)
         self.assertIn('Python 3.14.7 (aarch64)', result.stdout)
         self.assertIn('Qt 6.11.1', result.stdout)
         self.assertIn('SHA-256', result.stdout)
         self.assertIn('macOS system certificate store (pip-system-certs)',
                       result.stdout)
         config = SCRIPT.parents[2] / 'thirdparty' / 'aqt_settings.ini'
-        self.assertIn('AQT_CONFIG="' + str(config) + '" aqt install-qt',
+        self.assertIn('AQT_CONFIG="' + str(config) + '" ',
+                      result.stdout)
+        self.assertIn(str(self.root / tools / 'bin' / 'python3'),
                       result.stdout)
         self.assertFalse((self.root / 'deps with spaces').exists())
+        self.assertFalse((self.root / tools).exists())
 
     def test_prepare_config_is_resolved_from_caller(self):
         self._write_tool('uname', '''
@@ -125,8 +136,41 @@ esac
         self.env['AQT_CONFIG'] = config.name
         result = self._run('prepare', '--dry-run')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('AQT_CONFIG="' + str(config) + '" aqt install-qt',
+        self.assertIn('AQT_CONFIG="' + str(config) + '" ',
                       result.stdout)
+
+    def test_prepare_rejects_overlapping_prefixes(self):
+        self._write_tool('uname', "printf '%s\\n' Darwin\n")
+        sdk = self.root / 'sdk' / '6.11.1' / 'macos'
+        for tools in (sdk, sdk / 'tools', self.root / 'sdk'):
+            with self.subTest(tools=tools):
+                result = self._run('prepare', '--prefix', str(sdk),
+                                   '--tools-prefix', str(tools))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('separate, non-nested', result.stderr)
+                self.assertFalse(sdk.exists())
+
+    def test_reject_mixed_sdk_without_removing_packages(self):
+        sdk = self.root
+        site = sdk / 'lib' / 'python3.14' / 'site-packages'
+        metadata = site / 'cmake-4.4.3.dist-info'
+        metadata.mkdir(parents=True)
+        (metadata / 'METADATA').write_text('Name: cmake\nVersion: 4.4.3\n')
+        self.env['BUNDLE_FIXTURE_SITE'] = str(site)
+        self.env['BUNDLE_FIXTURE_PYTHON'] = sys.executable
+        self._write_tool('python3', '''
+exec "$BUNDLE_FIXTURE_PYTHON" -I -B -c '
+import os, sys
+sys.path.insert(0, os.environ["BUNDLE_FIXTURE_SITE"])
+exec(sys.stdin.read())
+'
+''')
+        result = self._run_functions(
+            'PREFIX="$1"\ncheck_runtime_packages', str(sdk))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('SDK contains build-only packages', result.stderr)
+        self.assertIn('cmake', result.stderr)
+        self.assertTrue((metadata / 'METADATA').exists())
 
     def test_prepare_rejects_missing_config_before_download(self):
         self._write_tool('uname', "printf '%s\\n' Darwin\n")

@@ -1,6 +1,6 @@
 # macOS Pilot Bundle
 
-`bundle-with-prefix.sh` uses an explicit dependency prefix, without devenv
+`bundle-with-prefix.sh` uses separate tools and SDK prefixes, without devenv
 activation or Homebrew. Only `prepare` downloads and installs dependencies.
 `check`, `bundle`, and `verify` do not install anything.
 
@@ -18,27 +18,41 @@ The matching Makefile targets are `bundle-prepare`, `bundle-precheck`,
 `bundle`, and `bundle-test`. `make bundle` checks the prefix and builds the
 artifact; it never prepares dependencies automatically.
 
-## Dependency Prefix
+## Dependency Prefixes
 
-The default prefix is `build/bundle-deps/6.11.1/macos`. It contains both Qt and
-a complete standalone Python installation:
+The tools prefix defaults to `build/bundle-deps/tools`. The SDK prefix defaults
+to `build/bundle-deps/sdk/6.11.1/macos`. Each has a complete standalone Python
+installation of the same version and native CPU architecture; neither is a
+venv. The same SHA-256-checked archive is downloaded once and extracted into
+each missing installation.
 
 ```text
-build/bundle-deps/6.11.1/macos/
-    bin/python3
-    bin/macdeployqt
-    bin/qtpaths
-    include/
-    lib/QtCore.framework/
-    lib/libpython3.14.dylib
-    lib/python3.14/site-packages/
+build/bundle-deps/
+    tools/
+        bin/python3
+        bin/cmake
+        lib/python3.14/site-packages/
+            aqt, py7zr, cmake, pybind11, pip_system_certs, ...
+    sdk/6.11.1/macos/
+        bin/python3
+        bin/macdeployqt
+        bin/qtpaths
+        include/
+        lib/QtCore.framework/
+        lib/libpython3.14.dylib
+        lib/python3.14/site-packages/
+            PySide6, shiboken6, numpy, matplotlib, ...
 ```
 
 `prepare` installs Qt with `aqt install-qt --outputdir`, preserving aqt's
-versioned directory layout. It installs Python into that same prefix. The
-standalone archive is SHA-256 checked before extraction. The native CPU
-selects the arm64 or x86_64 Python archive; this is not a universal2 Python
-build.
+versioned directory layout. Qt and runtime Python share the SDK prefix.
+Runtime dependencies are installed with tools pip's `--python` option,
+targeting the SDK interpreter. Build tools are installed in tools only.
+The native CPU selects arm64 or x86_64 Python; this is not a universal2 build.
+
+Qt, Python, PySide6 and NumPy also provide build-time headers and libraries.
+Those stay available in the SDK for compiling Pilot, but packaging copies
+only runtime contents. The SDK is not copied wholesale into the app.
 
 The Qt download uses the same `thirdparty/aqt_settings.ini` as CI, passed
 through the `AQT_CONFIG` environment variable for the aqt process. No manual
@@ -72,15 +86,15 @@ The MCAP codecs `zstandard` and `lz4` are also installed. Their versions and
 transitive pip dependencies are not locked. `shiboken6_generator` is not a
 required dependency: the referenced CI job builds without it.
 
-The standalone prefix also installs `pip-system-certs==5.3` as a preparation
+The tools prefix also installs `pip-system-certs==5.3` as a preparation
 dependency. Its startup hook makes Python SSL clients, including aqt's
 spawned download workers, use the macOS system certificate store through
 truststore. This addresses trust-chain differences when system curl succeeds
 but Requests cannot find an issuer. Certificate and hostname verification
 remain enabled. No Keychain certificates are added or trust policies changed.
 Preparation verifies that the startup hook is active before launching aqt.
-The hook affects Python processes in the dedicated prefix only; `.pth` files
-remain excluded from the packaged app.
+The hook affects tools Python processes only. No tools packages or startup
+hooks are copied into the packaged app.
 
 CI's installer action caches Qt, so a successful cached CI run does not
 prove that every download mirror is working. If certificate failures also
@@ -89,35 +103,47 @@ Requests accepts a trusted CA bundle through `REQUESTS_CA_BUNDLE`;
 Python's `-I` does not ignore that variable. Do not bypass TLS verification
 to complete the download.
 
-Choose another location with `--prefix DIR`, or `RELEASE_PREFIX=DIR` for
-Makefile targets. For `prepare`, the path must end in `/6.11.1/macos` so Qt
-and Python land in the same directory. Other commands accept an existing
-compatible prefix at any location. Relative prefix, output, and artifact
-paths are resolved against the caller's working directory.
+Choose another SDK location with `--prefix DIR` (`RELEASE_PREFIX=DIR` for
+Makefile targets). Choose tools with `--tools-prefix DIR`
+(`RELEASE_TOOLS_PREFIX=DIR`). The directories must be separate and not nested
+inside one another. For `prepare`, the SDK path must end in `/6.11.1/macos`
+so Qt and Python land in the same directory. Relative paths are resolved
+against the caller's working directory. Artifact `verify` needs neither
+installation and does not accept `--tools-prefix`.
 
 ```bash
 ./contrib/bundle/bundle-with-prefix.sh prepare \
-    --prefix "$HOME/solvcon-bundle-deps/6.11.1/macos"
-make bundle RELEASE_PREFIX="$HOME/solvcon-bundle-deps/6.11.1/macos"
+    --prefix "$HOME/solvcon-bundle-deps/sdk/6.11.1/macos" \
+    --tools-prefix "$HOME/solvcon-bundle-deps/tools"
+make bundle \
+    RELEASE_PREFIX="$HOME/solvcon-bundle-deps/sdk/6.11.1/macos" \
+    RELEASE_TOOLS_PREFIX="$HOME/solvcon-bundle-deps/tools"
 ```
 
-`prepare` writes into the selected prefix. Use a dedicated directory, not a
+`prepare` writes into both selected prefixes. Use dedicated directories, not a
 system Python installation. Xcode command-line tools and `make` must already
 be available. Do not substitute `pip install --target` for the complete
 Python runtime: Pilot embeds libpython and also needs its headers and stdlib.
 
+The previous mixed prefix `build/bundle-deps/6.11.1/macos` is left untouched.
+Use the new defaults to prepare a clean split installation. A selected SDK
+containing aqt, CMake, pybind11, py7zr or the certificate bootstrap is rejected
+rather than automatically uninstalled or copied into the app. Existing build
+directories remain usable because bundling performs a fresh configure.
+
 ## Packaging and Verification
 
 The script builds through `make pilot` in `build/relbundle`, with a fresh
-CMake configure tied to the selected Python and Qt. `BUNDLE_BUILD_PATH` may
-select another relative directory under `build/`. `--skip-build` accepts only
-an undeployed app, not a previous bundle.
+CMake configure tied to SDK Python and Qt, with pybind11 from tools.
+`BUNDLE_BUILD_PATH` may select another relative directory under `build/`.
+`--skip-build` accepts only an undeployed app, not a previous bundle.
 
-Python packages and distribution metadata are copied from the selected
-prefix, rather than inferred from a startup import trace. `.pth` startup
-hooks are excluded. PySide6 remains limited to Pilot's QtCore, QtGui,
-QtWidgets, and QtSvg bindings; the app uses the deployed Qt rather than the
-wheel's private Qt. The CPython test, Tk, and IDLE trees are excluded.
+Python packages and distribution metadata are copied from SDK only, rather
+than inferred from a startup import trace. Bootstrap pip, setuptools, wheel,
+their metadata and `.pth` startup hooks are excluded. PySide6 remains limited
+to Pilot's QtCore, QtGui, QtWidgets, and QtSvg bindings; the app uses the
+deployed Qt rather than the wheel's private Qt. The CPython test, Tk, and IDLE
+trees are excluded.
 
 Native dependencies are copied and rewritten inside the app only. Unresolved
 dependencies, failed Mach-O edits, and failed signatures stop the bundle.

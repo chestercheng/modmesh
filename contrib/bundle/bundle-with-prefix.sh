@@ -1,13 +1,14 @@
 #!/bin/bash
 #
 # This script is a prototype to create a self-contained macOS .app bundle for
-# solvcon from an explicit dependency prefix, package it into a DMG file, and
+# solvcon from separate tools and SDK prefixes, package it into a DMG file, and
 # verify both are hermetic. No devenv activation or Homebrew is needed.
 #
 #   - Python: python-build-standalone (not a macOS framework build), installed
 #     in the traditional prefix layout.
 #   - Qt: installed by aqt, retaining its <version>/macos layout.
-#   - PySide6, shiboken6, numpy, matplotlib: pip packages in the prefix.
+#   - PySide6, shiboken6, numpy, matplotlib: pip packages in the SDK prefix.
+#   - aqt, CMake, pybind11 and download TLS support: a separate tools prefix.
 #
 # It employs macdeployqt, otool, and install_name_tool to process the binaries,
 # and ad-hoc codesign to reseal them.
@@ -29,8 +30,9 @@
 #   --skip-check   Skip the bundle/DMG verification phase.
 #   --dry-run      Check the environment and print the plan; change nothing.
 #   --output DIR   Write pilot.dmg into DIR (default: build/).
-#   --prefix DIR   Dependency prefix (default: build/bundle-deps/6.11.1/macos).
+#   --prefix DIR   SDK prefix (default: build/bundle-deps/sdk/6.11.1/macos).
 #                  For `prepare`, DIR must end with /6.11.1/macos.
+#   --tools-prefix DIR  Tools prefix (default: build/bundle-deps/tools).
 #   AQT_CONFIG     Override the shared CI aqt settings file.
 #
 # The DMG holds pilot.app and a shortcut to /Applications. The icons are placed
@@ -58,7 +60,8 @@ BUNDLE_BUILD_PATH=${BUNDLE_BUILD_PATH:-build/relbundle}
 QT_VERSION=6.11.1
 PYTHON_VERSION=3.14.7
 PYTHON_RELEASE=20260929
-PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/$QT_VERSION/macos"
+PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/sdk/$QT_VERSION/macos"
+TOOLS_PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/tools"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,22 +70,23 @@ PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/$QT_VERSION/macos"
 usage() {
     cat <<'EOF'
 Usage:
-  contrib/bundle/bundle-with-prefix.sh prepare [--prefix DIR] [--dry-run]
-  contrib/bundle/bundle-with-prefix.sh check [--prefix DIR]
-  contrib/bundle/bundle-with-prefix.sh bundle [--prefix DIR] [--skip-build] [--skip-check] [--dry-run] [--output DIR]
+  contrib/bundle/bundle-with-prefix.sh prepare [--prefix DIR] [--tools-prefix DIR] [--dry-run]
+  contrib/bundle/bundle-with-prefix.sh check [--prefix DIR] [--tools-prefix DIR]
+  contrib/bundle/bundle-with-prefix.sh bundle [--prefix DIR] [--tools-prefix DIR] [--skip-build] [--skip-check] [--dry-run] [--output DIR]
   contrib/bundle/bundle-with-prefix.sh verify path/to/pilot.dmg [--prefix DIR]
-  contrib/bundle/bundle-with-prefix.sh all [--prefix DIR] [--skip-build] [--skip-check] [--dry-run] [--output DIR]
+  contrib/bundle/bundle-with-prefix.sh all [--prefix DIR] [--tools-prefix DIR] [--skip-build] [--skip-check] [--dry-run] [--output DIR]
 
 Subcommands:
-  prepare  Install standalone Python, aqt Qt, and pip packages into the prefix.
-  check    Check the dependency prefix. Does not build or install.
-  bundle   Build/package pilot.app and pilot.dmg from the prefix, then verify.
+  prepare  Install tools separately from the Python/Qt SDK and runtime packages.
+  check    Check both prefixes. Does not build or install.
+  bundle   Build with both prefixes, package runtime contents, then verify.
   verify   Verify a generated release DMG artifact.
   all      Run check and then bundle. Never installs dependencies.
 
-The default prefix is build/bundle-deps/6.11.1/macos under the repo.
+The default SDK prefix is build/bundle-deps/sdk/6.11.1/macos under the repo.
+The default tools prefix is build/bundle-deps/tools; it is never copied into the app.
 prepare requires a prefix ending in /6.11.1/macos, preserving aqt's layout.
-Relative --prefix, --output, and artifact paths are relative to the caller.
+Relative prefix, --output, and artifact paths are relative to the caller.
 --dry-run is available for prepare, bundle, and all; it changes nothing.
 prepare uses thirdparty/aqt_settings.ini, as CI does; AQT_CONFIG overrides it.
 EOF
@@ -101,12 +105,12 @@ setup_hint() {
 
 Prepare the default dependency prefix on macOS, then retry:
   ./contrib/bundle/bundle-with-prefix.sh prepare
-Or select an existing prefix with --prefix DIR.
+Or select existing SDK/tools prefixes with --prefix DIR and --tools-prefix DIR.
 EOF
 }
 
 prepare_prefix() {
-    local arch sha archive url deps_root version config
+    local arch sha archive url deps_root version config python_prefix
     config="${AQT_CONFIG:-$BUNDLE_REPO_ROOT/thirdparty/aqt_settings.ini}"
     case "$config" in /*) ;; *) config="$CALLER_DIR/$config" ;; esac
     [[ -f "$config" ]] || { fail "aqt settings file not found: $config"; return 1; }
@@ -127,36 +131,44 @@ prepare_prefix() {
     esac
     archive="cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-${arch}-apple-darwin-install_only.tar.gz"
     url="https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_RELEASE/$archive"
-    note "Dependency prefix: $PREFIX"
+    note "SDK prefix: $PREFIX"
+    note "Tools prefix: $TOOLS_PREFIX"
     note "Python $PYTHON_VERSION ($arch), standalone release $PYTHON_RELEASE"
     note "Qt $QT_VERSION (mac desktop clang_64), with qtshadertools"
     note "aqt settings: $config"
     note "aqt TLS: macOS system certificate store (pip-system-certs)"
     if [[ $DRY_RUN -ne 0 ]]; then
         note "DRY RUN: download $url and verify SHA-256 $sha"
-        note "Extract Python into $PREFIX; install pinned CI packages with its pip"
-        note "Run AQT_CONFIG=\"$config\" aqt install-qt mac desktop $QT_VERSION clang_64 --outputdir \"$deps_root\" --modules qtshadertools"
+        note "Extract the same Python archive into $TOOLS_PREFIX and $PREFIX"
+        note "Install aqt, CMake, pybind11 and TLS support in $TOOLS_PREFIX only"
+        note "Run AQT_CONFIG=\"$config\" \"$TOOLS_PREFIX/bin/python3\" -I -m aqt install-qt mac desktop $QT_VERSION clang_64 --outputdir \"$deps_root\" --modules qtshadertools"
+        note "Use tools pip --python \"$PREFIX/bin/python3\" to install runtime packages"
         return 0
     fi
+    if [[ -x "$PREFIX/bin/python3" ]]; then check_runtime_packages; fi
 
-    if [[ -e "$PREFIX/bin/python3" ]]; then
-        version=$("$PREFIX/bin/python3" -I -c 'import platform; print(platform.python_version())')
-        [[ "$version" == "$PYTHON_VERSION" ]] || \
-            { fail "prefix has Python $version; expected $PYTHON_VERSION. Choose a new prefix."; return 1; }
-    else
-        for cmd in curl tar shasum; do
-            require_command "$cmd"
-        done
-        PREPARE_TMP=$(mktemp -d -t solvcon-prefix)
-        curl --fail --location --retry 3 --output "$PREPARE_TMP/$archive" "$url"
-        [[ "$(shasum -a 256 "$PREPARE_TMP/$archive" | cut -d' ' -f1)" == "$sha" ]] || \
-            { fail "Python archive SHA-256 mismatch"; return 1; }
-        mkdir -p "$PREFIX"
-        tar -xzf "$PREPARE_TMP/$archive" --strip-components=1 -C "$PREFIX"
-    fi
+    for python_prefix in "$TOOLS_PREFIX" "$PREFIX"; do
+        if [[ -e "$python_prefix/bin/python3" ]]; then
+            version=$("$python_prefix/bin/python3" -I -B -c 'import platform; print(platform.python_version())')
+            [[ "$version" == "$PYTHON_VERSION" ]] || \
+                { fail "$python_prefix has Python $version; expected $PYTHON_VERSION. Choose a new prefix."; return 1; }
+        else
+            if [[ -z "$PREPARE_TMP" ]]; then
+                for cmd in curl tar shasum; do require_command "$cmd"; done
+                PREPARE_TMP=$(mktemp -d -t solvcon-prefix)
+                curl --fail --location --retry 3 --output "$PREPARE_TMP/$archive" "$url"
+                [[ "$(shasum -a 256 "$PREPARE_TMP/$archive" | cut -d' ' -f1)" == "$sha" ]] || \
+                    { fail "Python archive SHA-256 mismatch"; return 1; }
+            fi
+            mkdir -p "$python_prefix"
+            tar -xzf "$PREPARE_TMP/$archive" --strip-components=1 -C "$python_prefix"
+        fi
+    done
     PREFIX=$(cd "$PREFIX" && pwd -P)
+    TOOLS_PREFIX=$(cd "$TOOLS_PREFIX" && pwd -P)
+    check_prefix_layout
     deps_root=${PREFIX%/"$QT_VERSION"/macos}
-    export PATH="$PREFIX/bin:$PATH"
+    export PATH="$PREFIX/bin:$TOOLS_PREFIX/bin:$PATH"
     python_dylib_check >/dev/null
     if [[ -x "$PREFIX/bin/qtpaths" ]]; then
         version=$("$PREFIX/bin/qtpaths" --query QT_VERSION)
@@ -165,10 +177,10 @@ prepare_prefix() {
     fi
     # aqt spawns fresh worker interpreters on macOS. The .pth bootstrap enables
     # system certificate verification in the workers as well as the parent.
-    "$PREFIX/bin/python3" -I -m pip --isolated install \
+    "$TOOLS_PREFIX/bin/python3" -I -m pip --isolated install \
         'pip-system-certs==5.3' 'aqtinstall==3.3.0' 'py7zr==1.1.0' \
         'cmake==4.4.3' 'pybind11==3.0.1'
-    "$PREFIX/bin/python3" -I -B - <<'PY'
+    "$TOOLS_PREFIX/bin/python3" -I -B - <<'PY'
 import ssl
 from pip._vendor import truststore
 
@@ -179,14 +191,21 @@ if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
     raise SystemExit('TLS certificate and hostname checks must remain enabled')
 print('    OK: macOS system certificate verification is active')
 PY
-    AQT_CONFIG="$config" "$PREFIX/bin/python3" -I -m aqt install-qt mac desktop "$QT_VERSION" clang_64 \
+    AQT_CONFIG="$config" "$TOOLS_PREFIX/bin/python3" -I -m aqt install-qt mac desktop "$QT_VERSION" clang_64 \
         --outputdir "$deps_root" --modules qtshadertools
-    "$PREFIX/bin/python3" -I -m pip --isolated install --only-binary=:all: \
+    "$TOOLS_PREFIX/bin/python3" -I -m pip --isolated --python "$PREFIX/bin/python3" install --only-binary=:all: \
         "PySide6==$QT_VERSION" "shiboken6==$QT_VERSION" \
         'numpy==2.5.3' 'matplotlib==3.11.2' 'jsonschema==4.26.0' \
         zstandard lz4
     check_deps
-    note "Dependency preparation complete: $PREFIX"
+    note "Preparation complete: tools=$TOOLS_PREFIX, SDK=$PREFIX"
+}
+
+check_prefix_layout() {
+    if [[ "$TOOLS_PREFIX" == "$PREFIX" || "$TOOLS_PREFIX" == "$PREFIX"/* || "$PREFIX" == "$TOOLS_PREFIX"/* ]]; then
+        fail "tools and SDK prefixes must be separate, non-nested directories"
+        return 1
+    fi
 }
 
 require_command() {
@@ -200,12 +219,12 @@ require_command() {
 
 # Resolve a command and require it to live under the selected prefix.
 require_in_prefix() {
-    local cmd="$1" path
+    local cmd="$1" prefix="${2:-$PREFIX}" path
     path=$(command -v "$cmd" 2>/dev/null || true)
-    if [[ -n "$path" && "$path" == "$PREFIX"/* ]]; then
-        ok "$cmd is under the dependency prefix: $path"
+    if [[ -n "$path" && "$path" == "$prefix"/* ]]; then
+        ok "$cmd is under its selected prefix: $path"
     else
-        fail "$cmd is not from the dependency prefix (${path:-not found}; expected under $PREFIX)"
+        fail "$cmd is not from its selected prefix (${path:-not found}; expected under $prefix)"
     fi
 }
 
@@ -252,19 +271,40 @@ python_dylib_check() {
 
 check_pybind11_cmake() {
     local config_dir
-    config_dir=$("$PREFIX/bin/python3" -I -B -m pybind11 --cmakedir 2>/dev/null || true)
-    if [[ "$config_dir" == "$PREFIX"/* && -f "$config_dir/pybind11Config.cmake" ]]; then
+    config_dir=$("$TOOLS_PREFIX/bin/python3" -I -B -m pybind11 --cmakedir 2>/dev/null || true)
+    if [[ "$config_dir" == "$TOOLS_PREFIX"/* && -f "$config_dir/pybind11Config.cmake" ]]; then
         ok "pybind11 CMake config: $config_dir/pybind11Config.cmake"
         return 0
     fi
-    fail "pybind11 CMake config: not found (python3 -m pip install pybind11)"
+    fail "pybind11 CMake config: not found in the tools prefix"
+}
+
+check_runtime_packages() {
+    "$PREFIX/bin/python3" -I -B - <<'PY'
+import importlib.metadata
+
+tools = ('aqtinstall', 'cmake', 'pybind11', 'py7zr', 'pip-system-certs')
+installed = []
+for name in tools:
+    try:
+        importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        continue
+    installed.append(name)
+if installed:
+    raise SystemExit('SDK contains build-only packages: '
+                     + ', '.join(installed)
+                     + '. Prepare a new SDK prefix; the old one is unchanged.')
+PY
 }
 
 check_deps() {
-    local dylib_path failed=0 qt_ver pyside_ver
+    local dylib_path failed=0 qt_ver pyside_ver tools_ver sdk_ver
     require_macos
 
-    ok "dependency prefix: $PREFIX"
+    check_prefix_layout
+    ok "SDK prefix: $PREFIX"
+    ok "tools prefix: $TOOLS_PREFIX"
 
     for cmd in cmake make python3 macdeployqt qtpaths otool \
         install_name_tool codesign hdiutil rsync shasum; do
@@ -274,6 +314,11 @@ check_deps() {
     require_in_prefix python3 || failed=1
     require_in_prefix macdeployqt || failed=1
     require_in_prefix qtpaths || failed=1
+    require_in_prefix cmake "$TOOLS_PREFIX" || failed=1
+    tools_ver=$("$TOOLS_PREFIX/bin/python3" -I -B -c 'import platform; print(platform.python_version())' 2>/dev/null || true)
+    sdk_ver=$("$PREFIX/bin/python3" -I -B -c 'import platform; print(platform.python_version())' 2>/dev/null || true)
+    [[ -n "$tools_ver" && "$tools_ver" == "$sdk_ver" ]] || \
+        { fail "tools Python (${tools_ver:-missing}) and SDK Python (${sdk_ver:-missing}) versions differ" || failed=1; }
 
     if dylib_path=$(python_dylib_check 2>&1); then
         ok "Python shared library: $dylib_path"
@@ -282,6 +327,7 @@ check_deps() {
     fi
 
     check_pybind11_cmake || failed=1
+    check_runtime_packages || failed=1
     python_module_check numpy "python3 -m pip install numpy" || failed=1
     python_module_check PySide6 "python3 -m pip install pyside6" || failed=1
     python_module_check shiboken6 "python3 -m pip install shiboken6" || failed=1
@@ -646,11 +692,16 @@ OUTPUT_DIR="$BUNDLE_REPO_ROOT/build"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --prefix|--output)
+        --prefix|--tools-prefix|--output)
             [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || \
                 { echo "Missing argument for $1" >&2; exit 2; }
             if [[ "$1" == --prefix ]]; then
                 PREFIX="$2"
+            elif [[ "$1" == --tools-prefix && "$COMMAND" != verify ]]; then
+                TOOLS_PREFIX="$2"
+            elif [[ "$1" == --tools-prefix ]]; then
+                echo "--tools-prefix is not needed by verify" >&2
+                exit 2
             elif [[ "$COMMAND" == bundle || "$COMMAND" == all ]]; then
                 OUTPUT_DIR="$2"
             else
@@ -686,8 +737,11 @@ done
 [[ "$COMMAND" != verify || -n "$VERIFY_ARTIFACT" ]] || { usage >&2; exit 2; }
 
 case "$PREFIX" in /*) ;; *) PREFIX="$CALLER_DIR/$PREFIX" ;; esac
+case "$TOOLS_PREFIX" in /*) ;; *) TOOLS_PREFIX="$CALLER_DIR/$TOOLS_PREFIX" ;; esac
 PREFIX=${PREFIX%/}
+TOOLS_PREFIX=${TOOLS_PREFIX%/}
 [[ -n "$PREFIX" && "$PREFIX" != / ]] || { echo "--prefix must not be the filesystem root" >&2; exit 2; }
+[[ -n "$TOOLS_PREFIX" && "$TOOLS_PREFIX" != / ]] || { echo "--tools-prefix must not be the filesystem root" >&2; exit 2; }
 case "$OUTPUT_DIR" in /*) ;; *) OUTPUT_DIR="$CALLER_DIR/$OUTPUT_DIR" ;; esac
 if [[ -n "$VERIFY_ARTIFACT" && "$VERIFY_ARTIFACT" != /* ]]; then
     VERIFY_ARTIFACT="$CALLER_DIR/$VERIFY_ARTIFACT"
@@ -696,8 +750,13 @@ require_macos
 if [[ -d "$PREFIX" ]]; then
     PREFIX=$(cd "$PREFIX" && pwd -P)
 fi
+if [[ -d "$TOOLS_PREFIX" ]]; then
+    TOOLS_PREFIX=$(cd "$TOOLS_PREFIX" && pwd -P)
+fi
 [[ "$PREFIX" != / ]] || { echo "--prefix must not resolve to the filesystem root" >&2; exit 2; }
-export PATH="$PREFIX/bin:$PATH"
+[[ "$TOOLS_PREFIX" != / ]] || { echo "--tools-prefix must not resolve to the filesystem root" >&2; exit 2; }
+if [[ "$COMMAND" != verify ]]; then check_prefix_layout; fi
+export PATH="$PREFIX/bin:$TOOLS_PREFIX/bin:$PATH"
 export PYTHONNOUSERSITE=1
 unset PYTHONHOME PYTHONPATH
 PREFIX_ESC=$(printf '%s' "$PREFIX" | sed 's/[][\.*^$+?(){}|]/\\&/g')
@@ -767,6 +826,10 @@ if [[ "$PREFIX" == "$APP" || "$PREFIX" == "$APP"/* ]]; then
     fail "dependency prefix must not be inside the app being rebuilt"
     exit 2
 fi
+if [[ "$TOOLS_PREFIX" == "$APP" || "$TOOLS_PREFIX" == "$APP"/* ]]; then
+    fail "tools prefix must not be inside the app being rebuilt"
+    exit 2
+fi
 BINARY="$APP/Contents/MacOS/pilot"
 FW_DIR="$APP/Contents/Frameworks"
 PY_DYLIB="$PREFIX/lib/libpython${PY_VER}.dylib"
@@ -796,6 +859,7 @@ done <<< "$SITE_PATHS"
 [[ -n "$SITE_PATHS" ]] || { fail "no site-packages found in $PREFIX"; exit 1; }
 
 echo "==> Prefix     : $PREFIX"
+echo "==> Tools      : $TOOLS_PREFIX (not bundled)"
 echo "==> Build path : $BUILD_PATH"
 echo "==> App bundle : $APP"
 echo "==> libpython  : $PY_DYLIB"
@@ -834,7 +898,7 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     # build produces a virgin one each run.
     rm -rf "$APP"
     echo "==> make pilot BUILD_PATH=$BUILD_PATH"
-    PYBIND11_CMAKE_DIR=$("$PREFIX/bin/python3" -I -B -m pybind11 --cmakedir)
+    PYBIND11_CMAKE_DIR=$("$TOOLS_PREFIX/bin/python3" -I -B -m pybind11 --cmakedir)
     env -u CMAKE_PREFIX_PATH make -W CMakeLists.txt pilot BUILD_PATH="$BUILD_PATH" \
         CMAKE_ARGS="${CMAKE_ARGS:-} --fresh -DCMAKE_PREFIX_PATH=\"$PREFIX\" -DQt6_DIR=\"$PREFIX/lib/cmake/Qt6\" -DPYTHON_EXECUTABLE=\"$PREFIX/bin/python3\" -Dpybind11_DIR=\"$PYBIND11_CMAKE_DIR\""
 elif [[ -d "$FW_DIR" ]]; then
@@ -906,6 +970,10 @@ echo "==> Copying Python packages into bundled site-packages"
 for SITE in "${SITE_DIRS[@]}"; do
     rsync -aL --exclude '__pycache__' --exclude '*.pth' \
         --exclude 'solvcon' --exclude '_solvcon*.so' \
+        --exclude 'pip' --exclude 'pip-*.dist-info' \
+        --exclude 'setuptools' --exclude 'setuptools-*.dist-info' \
+        --exclude '_distutils_hack' --exclude 'pkg_resources' \
+        --exclude 'wheel' --exclude 'wheel-*.dist-info' \
         "$SITE/" "$BUNDLED_SITE/"
 done
 # The PySide6 wheel carries every Qt binding plus qml, plugins, translations,
