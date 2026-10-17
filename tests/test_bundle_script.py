@@ -180,14 +180,13 @@ exec(sys.stdin.read())
         self.assertIn('aqt settings file not found', result.stderr)
         self.assertFalse((self.root / 'deps').exists())
 
-    def test_ci_config_excludes_failing_mirror(self):
+    def test_ci_config_uses_origin_without_disabling_checksums(self):
         config = configparser.ConfigParser()
         config.read(SCRIPT.parents[2] / 'thirdparty' / 'aqt_settings.ini')
-        host = 'ftp.yz.yamagata-u.ac.jp'
-        blacklist = config.get('mirrors', 'blacklist').splitlines()
-        self.assertIn('http://' + host, blacklist)
-        self.assertIn('https://' + host, blacklist)
-        self.assertNotIn(host, config.get('mirrors', 'fallbacks'))
+        self.assertEqual(config.get('aqt', 'baseurl'), 'https://master.qt.io')
+        mirrors = config.get('mirrors', 'trusted_mirrors').split()
+        self.assertEqual(mirrors[0], 'https://master.qt.io/')
+        self.assertEqual(config.get('requests', 'hash_algorithm'), 'sha1')
         self.assertFalse(config.getboolean(
             'requests', 'INSECURE_NOT_FOR_PRODUCTION_ignore_hash'))
 

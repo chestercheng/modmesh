@@ -57,10 +57,11 @@ only runtime contents. The SDK is not copied wholesale into the app.
 The Qt download uses the same `thirdparty/aqt_settings.ini` as CI, passed
 through the `AQT_CONFIG` environment variable for the aqt process. No manual
 `AQT_CONFIG` export is needed.
-The shared settings blacklist the Yamagata mirror for redirects and remove
-it from fallbacks after TLS certificate validation failures. TLS
-verification and archive checksum checking stay enabled; the checksum
-algorithm remains `sha1` to match the existing CI settings.
+The shared settings use the official Qt origin, `https://master.qt.io`, as
+the primary archive and checksum source. This avoids the mirror redirects
+from `download.qt.io` during normal downloads. The existing fallback list
+still applies to connection failures. TLS verification and archive checksum
+checking stay enabled; the checksum algorithm remains `sha1` to match CI.
 
 `AQT_CONFIG` can select another settings file. Relative overrides are
 resolved against the caller's working directory. The selected path appears
@@ -102,6 +103,15 @@ occur despite the system-trust bootstrap, check the network/proxy CA trust.
 Requests accepts a trusted CA bundle through `REQUESTS_CA_BUNDLE`;
 Python's `-I` does not ignore that variable. Do not bypass TLS verification
 to complete the download.
+
+An archive checksum mismatch is not a certificate error. Do not change the
+expected hash or disable checksum verification. The downloader in aqt 3.3.0
+does not check archive HTTP status before hashing the body, so an HTTP error
+page can look like a corrupt archive. The reported source URL may also be
+the original URL rather than the final mirror. If origin downloads still
+fail, inspect the response's final URL, status, size and content type before
+changing download policy. Retry `prepare` without deleting either prefix;
+it reuses existing Python installations and downloads Qt again.
 
 Choose another SDK location with `--prefix DIR` (`RELEASE_PREFIX=DIR` for
 Makefile targets). Choose tools with `--tools-prefix DIR`
