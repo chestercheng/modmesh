@@ -875,7 +875,7 @@ done
 if [[ $DRY_RUN -ne 0 ]]; then
     echo ""
     echo "DRY RUN: nothing was changed. The bundle step would:"
-    echo "  1. rm -rf $APP and run: make pilot BUILD_PATH=$BUILD_PATH"
+    echo "  1. rm -rf $APP and run: make pilot BUILD_PATH=$BUILD_PATH (with C++23 toolchain check)"
     echo "  2. macdeployqt \"$APP\""
     echo "  3. copy libpython${PY_VER}.dylib into Contents/Frameworks and the stdlib into Contents/lib"
     echo "  4. copy the prefix's site-packages into $BUNDLED_SITE"
@@ -900,7 +900,7 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     echo "==> make pilot BUILD_PATH=$BUILD_PATH"
     PYBIND11_CMAKE_DIR=$("$TOOLS_PREFIX/bin/python3" -I -B -m pybind11 --cmakedir)
     env -u CMAKE_PREFIX_PATH make -W CMakeLists.txt pilot BUILD_PATH="$BUILD_PATH" \
-        CMAKE_ARGS="${CMAKE_ARGS:-} --fresh -DCMAKE_PREFIX_PATH=\"$PREFIX\" -DQt6_DIR=\"$PREFIX/lib/cmake/Qt6\" -DPYTHON_EXECUTABLE=\"$PREFIX/bin/python3\" -Dpybind11_DIR=\"$PYBIND11_CMAKE_DIR\""
+        CMAKE_ARGS="${CMAKE_ARGS:-} --fresh -DCMAKE_PROJECT_solvcon_INCLUDE=\"$SCRIPT_DIR/check-toolchain.cmake\" -DCMAKE_PREFIX_PATH=\"$PREFIX\" -DQt6_DIR=\"$PREFIX/lib/cmake/Qt6\" -DPYTHON_EXECUTABLE=\"$PREFIX/bin/python3\" -Dpybind11_DIR=\"$PYBIND11_CMAKE_DIR\""
 elif [[ -d "$FW_DIR" ]]; then
     fail "--skip-build requires an undeployed app; rerun without --skip-build"
     exit 1
@@ -952,9 +952,11 @@ echo "    libpython -> $FW_DIR/$(basename "$PY_DYLIB")"
 
 # The standard library, minus what pilot never uses. site-packages is filled
 # in Step 4. The CPython test suite and the Tk and IDLE trees are the bulk.
+# _tkinter is unusable without tkinter and may not have room for rpath edits.
 rsync -aL \
     --exclude '__pycache__' --exclude 'site-packages' --exclude 'test' \
-    --exclude 'tkinter' --exclude 'idlelib' --exclude 'turtledemo' \
+    --exclude 'tkinter' --exclude '_tkinter*.so' \
+    --exclude 'idlelib' --exclude 'turtledemo' \
     --exclude 'ensurepip' --exclude 'config-*' \
     "$PY_STDLIB/" "$BUNDLED_LIB/"
 mkdir -p "$BUNDLED_SITE"

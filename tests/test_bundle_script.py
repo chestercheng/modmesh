@@ -16,6 +16,7 @@ import unittest
 
 SCRIPT = (pathlib.Path(__file__).resolve().parents[1]
           / 'contrib' / 'bundle' / 'bundle-with-prefix.sh')
+TOOLCHAIN_CHECK = SCRIPT.with_name('check-toolchain.cmake')
 
 
 @unittest.skipUnless(os.name == 'posix', 'requires a POSIX shell')
@@ -196,6 +197,28 @@ exec(sys.stdin.read())
         self.assertGreaterEqual(len(programs), 3)
         for program in programs:
             ast.parse(program)
+
+    def test_bundle_configures_with_toolchain_check(self):
+        script = SCRIPT.read_text()
+        self.assertIn(
+            '-DCMAKE_PROJECT_solvcon_INCLUDE='
+            '\\"$SCRIPT_DIR/check-toolchain.cmake\\"', script)
+
+    def test_toolchain_check_covers_required_cxx23_features(self):
+        check = TOOLCHAIN_CHECK.read_text()
+        for feature in ('std::format', 'std::mdspan',
+                        'std::ranges::fold_left',
+                        'std::make_unique_for_overwrite',
+                        'static int operator()'):
+            with self.subTest(feature=feature):
+                self.assertIn(feature, check)
+        self.assertIn('xcode-select -p', check)
+        self.assertIn('xcrun --sdk macosx --show-sdk-path', check)
+
+    def test_stdlib_excludes_complete_tk_runtime(self):
+        script = SCRIPT.read_text()
+        self.assertIn("--exclude 'tkinter'", script)
+        self.assertIn("--exclude '_tkinter*.so'", script)
 
     def test_rpaths_preserve_spaces_and_deduplicate_slices(self):
         entry = '''Load command 0

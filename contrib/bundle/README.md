@@ -141,6 +141,37 @@ containing aqt, CMake, pybind11, py7zr or the certificate bootstrap is rejected
 rather than automatically uninstalled or copied into the app. Existing build
 directories remain usable because bundling performs a fresh configure.
 
+## Compiler and SDK
+
+Installing the Python/Qt dependencies does not install or upgrade Apple's
+C++ compiler or standard library. The selected Xcode or Command Line Tools
+must provide the C++23 features used by the project: `std::format`,
+`std::mdspan`, `std::ranges::fold_left`, `std::make_unique_for_overwrite`
+and static `operator()`. A C++23 command-line flag alone is not sufficient.
+
+The reference successful macOS CI job uses Xcode 26.6 and AppleClang 21.0.0.
+AppleClang 14.0.3 with the older CLT SDK does not provide the required
+features. Select an installed, sufficiently recent Xcode per invocation:
+
+```bash
+DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer" \
+    ./contrib/bundle/bundle-with-prefix.sh bundle
+```
+
+Adjust the path to the Xcode installation on your machine. This does not
+change the system-wide `xcode-select` setting. The script does not download
+Xcode or silently substitute a Homebrew compiler. Existing `CC`, `CXX`,
+`SDKROOT` or compiler/sysroot settings in `CMAKE_ARGS` can also affect the
+selection; remove stale overrides when changing toolchains.
+
+Bundling includes `check-toolchain.cmake` through the root project's CMake
+hook. It checks the actual selected compiler, SDK and flags during configure,
+before compiling Pilot. Failure names the compiler and required features.
+The probe compiles and links a small program but does not execute it.
+The fresh configure prevents an old compiler-capability result from masking
+a changed Xcode selection. `prepare` and artifact `verify` do not run this
+compiler probe.
+
 ## Packaging and Verification
 
 The script builds through `make pilot` in `build/relbundle`, with a fresh
@@ -153,7 +184,7 @@ than inferred from a startup import trace. Bootstrap pip, setuptools, wheel,
 their metadata and `.pth` startup hooks are excluded. PySide6 remains limited
 to Pilot's QtCore, QtGui, QtWidgets, and QtSvg bindings; the app uses the
 deployed Qt rather than the wheel's private Qt. The CPython test, Tk, and IDLE
-trees are excluded.
+trees and the unused `_tkinter` native extension are excluded.
 
 Native dependencies are copied and rewritten inside the app only. Unresolved
 dependencies, failed Mach-O edits, and failed signatures stop the bundle.
