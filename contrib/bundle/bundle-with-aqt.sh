@@ -35,6 +35,8 @@ PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/sdk/$QT_VERSION/macos"
 TOOLS_PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/tools"
 HOST_PREFIX_RE="^(${PREFIX//./\.}|${TOOLS_PREFIX//./\.})"
 export PATH="$PREFIX/bin:$TOOLS_PREFIX/bin:$PATH"
+export PYTHONNOUSERSITE=1
+unset PYTHONHOME PYTHONPATH
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -235,19 +237,24 @@ verify_app_structure() {
 
 runtime_import_check() {
     local bin="$1"
-    env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
-        PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
-        "$bin" --mode=python -c \
-        "import matplotlib; import solvcon.pilot._base_app"
+    (
+        cd "$VERIFY_TMP"
+        env -i HOME="$VERIFY_TMP/home" USER="${USER:-nobody}" \
+            PATH=/usr/bin:/bin TERM="${TERM:-xterm}" PYTHONNOUSERSITE=1 \
+            "$bin" --mode=python -c \
+            "import matplotlib.pyplot; import solvcon.pilot.base._base_app"
+    )
 }
 
 smoke_launch_verify() {
     local bin="$1" trace="$2" pid elapsed=0 loaded
     : > "$trace"
-    env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
-        PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
-        DYLD_PRINT_LIBRARIES=1 \
-        "$bin" >/dev/null 2>"$trace" &
+    (
+        cd "$VERIFY_TMP"
+        exec env -i HOME="$VERIFY_TMP/home" USER="${USER:-nobody}" \
+            PATH=/usr/bin:/bin TERM="${TERM:-xterm}" PYTHONNOUSERSITE=1 \
+            DYLD_PRINT_LIBRARIES=1 "$bin"
+    ) >/dev/null 2>"$trace" &
     pid=$!
     while [[ $elapsed -lt 15 ]]; do
         sleep 1
@@ -302,6 +309,7 @@ verify_dmg() {
     trace="$VERIFY_TRACE"
     marker="$VERIFY_MARKER"
     trap cleanup_verify EXIT
+    mkdir -p "$tmp/home"
 
     note "Mounting DMG"
     hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
@@ -406,6 +414,7 @@ DMG_MOUNT=""
 cleanup() {
     [[ -n "$CLOSURE_TMP" ]] && rm -rf "$CLOSURE_TMP"
     [[ -n "$TRACE" ]] && rm -f "$TRACE"
+    [[ -n "${VERIFY_TMP:-}" ]] && rm -rf "$VERIFY_TMP"
     if [[ -n "$DMG_MOUNT" ]]; then
         hdiutil detach -quiet "$DMG_MOUNT" >/dev/null 2>&1 \
             || hdiutil detach -force -quiet "$DMG_MOUNT" >/dev/null 2>&1 \
@@ -469,43 +478,6 @@ def add(p):
 for d in site.getsitepackages():
     add(d)
 print('\n'.join(out))
-")
-
-# Resolve the closure of Python packages pilot actually imports, so Step 4
-# copies only those, not the developer's full site-packages (which can
-# contain unrelated packages: vtkmodules, openvino, PyQt6, ...). Override
-# seeds via BUNDLE_SEED_MODULES; force-add via BUNDLE_EXTRA_PACKAGES (for
-# lazy / runtime imports the probe cannot observe, e.g. matplotlib backends
-# loaded on first render). Failed seed imports go to stderr so a partial
-# closure is visible instead of silently shipping a broken bundle.
-WANTED_PATHS=()
-while IFS= read -r line; do
-    [[ -n "$line" ]] && WANTED_PATHS+=("$line")
-done < <(python3 -c "
-import importlib, os, sys
-seeds = os.environ.get('BUNDLE_SEED_MODULES',
-    'PySide6.QtCore,PySide6.QtWidgets,PySide6.QtGui,numpy,matplotlib,'
-    'dateutil.relativedelta,dateutil.tz,dateutil.parser,jsonschema,'
-    'zstandard,lz4.frame').split(',')
-extras = os.environ.get('BUNDLE_EXTRA_PACKAGES', '').split(',')
-for m in seeds + extras:
-    m = m.strip()
-    if not m: continue
-    try: importlib.import_module(m)
-    except Exception as e:
-        sys.stderr.write('    WARN: seed import %s failed: %s\n' % (m, e))
-out = set()
-for name, mod in list(sys.modules.items()):
-    if mod is None or '.' in name: continue
-    p = getattr(mod, '__path__', None)
-    f = getattr(mod, '__file__', None) or ''
-    if p:
-        for d in p:
-            if 'site-packages' in d:
-                out.add(os.path.realpath(d)); break
-    elif 'site-packages' in f:
-        out.add(os.path.realpath(f))
-print('\n'.join(sorted(out)))
 ")
 
 echo "==> Build path : $BUILD_PATH"
@@ -575,26 +547,16 @@ echo "    [Step 3 (Bundle Python runtime): $((SECONDS - T_STEP))s]"
 
 T_STEP=$SECONDS
 echo "==> Copying Python packages into bundled site-packages"
-# Copy the closure resolved above (dir => rsync tree, file => cp).
-# -L dereferences symlinks. Falls back to every SITE_DIR if the probe
-# failed, so the script still runs when import discovery breaks.
-if [[ ${#WANTED_PATHS[@]} -gt 0 ]]; then
-    echo "    closure: ${#WANTED_PATHS[@]} entries (override via BUNDLE_SEED_MODULES / BUNDLE_EXTRA_PACKAGES)"
-    for path in "${WANTED_PATHS[@]}"; do
-        if [[ -d "$path" ]]; then
-            rsync -aL --exclude '__pycache__' --exclude '*.pth' \
-                "$path" "$BUNDLED_SITE/"
-        elif [[ -f "$path" ]]; then
-            cp -L "$path" "$BUNDLED_SITE/"
-        fi
-    done
-else
-    echo "    WARNING: import-closure discovery failed; copying full SITE_DIRS"
-    for SITE in "${SITE_DIRS[@]}"; do
-        rsync -aL --exclude '__pycache__' --exclude '*.pth' \
-            "$SITE/" "$BUNDLED_SITE/"
-    done
-fi
+for SITE in "${SITE_DIRS[@]}"; do
+    rsync -aL --exclude '__pycache__' --exclude '*.pth' \
+        --exclude 'solvcon' --exclude '_solvcon*.so' \
+        --exclude 'pip' --exclude 'pip-*.dist-info' \
+        --exclude 'setuptools' --exclude 'setuptools-*.dist-info' \
+        --exclude '_distutils_hack' --exclude 'pkg_resources' \
+        --exclude 'wheel' --exclude 'wheel-*.dist-info' \
+        "$SITE/" "$BUNDLED_SITE/"
+done
+rm -rf "$BUNDLED_SITE/PySide6/scripts"
 echo "    [Step 4 (Bundle site-packages): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
@@ -1064,10 +1026,12 @@ echo "DMG complete: $DMG ($SIZE)"
 launch_and_trace() {
     local bin="$1" pid elapsed=0 loaded
     : > "$TRACE"
-    env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
-        PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
-        DYLD_PRINT_LIBRARIES=1 \
-        "$bin" >/dev/null 2>"$TRACE" &
+    (
+        cd "$VERIFY_TMP"
+        exec env -i HOME="$VERIFY_TMP/home" USER="${USER:-nobody}" \
+            PATH=/usr/bin:/bin TERM="${TERM:-xterm}" PYTHONNOUSERSITE=1 \
+            DYLD_PRINT_LIBRARIES=1 "$bin"
+    ) >/dev/null 2>"$TRACE" &
     pid=$!
     while [[ $elapsed -lt 15 ]]; do
         sleep 1
@@ -1109,11 +1073,14 @@ smoke_check() {
 if [[ $SKIP_CHECK -eq 0 ]]; then
     T_STEP=$SECONDS
     TRACE=$(mktemp -t check-bundle-trace)
+    VERIFY_TMP=$(mktemp -d -t check-bundle-runtime)
+    mkdir -p "$VERIFY_TMP/home"
 
     echo ""
     echo "==> Checking $APP"
     echo "==> Static scan for host package path references"
     check_self_contained "$APP"
+    runtime_import_check "$BINARY"
     smoke_check "$BINARY"
     echo ""
     echo "Bundle check passed: $APP"
@@ -1130,6 +1097,7 @@ if [[ $SKIP_CHECK -eq 0 ]]; then
     echo "==> Static scan (DMG) for host package path references"
     check_self_contained "$DMG_APP"
     DMG_BINARY="$DMG_APP/Contents/MacOS/$(basename "$DMG_APP" .app)"
+    runtime_import_check "$DMG_BINARY"
     smoke_check "$DMG_BINARY" "DMG"
     echo ""
     echo "DMG check passed: $DMG"
