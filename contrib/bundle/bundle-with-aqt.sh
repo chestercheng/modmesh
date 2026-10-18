@@ -133,7 +133,7 @@ check_deps() {
     ok "tools prefix: $TOOLS_PREFIX"
 
     for cmd in cmake make python3 macdeployqt qtpaths otool \
-        install_name_tool codesign hdiutil rsync shasum; do
+        install_name_tool codesign ditto hdiutil readlink rsync shasum; do
         require_command "$cmd" || failed=1
     done
 
@@ -246,6 +246,14 @@ runtime_import_check() {
     )
 }
 
+verify_applications_shortcut() {
+    local shortcut="$1/Applications"
+    [[ -L "$shortcut" ]] || fail "Applications shortcut is missing"
+    [[ "$(readlink "$shortcut")" == "/Applications" ]] \
+        || fail "Applications shortcut does not point to /Applications"
+    ok "Applications shortcut: /Applications"
+}
+
 smoke_launch_verify() {
     local bin="$1" trace="$2" pid elapsed=0 loaded
     : > "$trace"
@@ -313,6 +321,7 @@ verify_dmg() {
 
     note "Mounting DMG"
     hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
+    verify_applications_shortcut "$mnt"
     app=$(find "$mnt" -maxdepth 2 -name '*.app' -type d -print -quit)
     [[ -n "$app" ]] || fail "no .app found in $dmg"
     bin="$app/Contents/MacOS/$(basename "$app" .app)"
@@ -404,17 +413,19 @@ fi
 T_SCRIPT=$SECONDS
 T_STEP=$T_SCRIPT
 
-# Single cleanup hook for every temp resource the script creates. EachS
+# Single cleanup hook for every temp resource the script creates. Each
 # variable is initialised empty here and populated lazily (in later steps).
 # The trap is set once. Any later step can register a temp file or DMG mount
 # without juggling its own trap.
 CLOSURE_TMP=""
 TRACE=""
 DMG_MOUNT=""
+DMG_STAGE=""
 cleanup() {
     [[ -n "$CLOSURE_TMP" ]] && rm -rf "$CLOSURE_TMP"
     [[ -n "$TRACE" ]] && rm -f "$TRACE"
     [[ -n "${VERIFY_TMP:-}" ]] && rm -rf "$VERIFY_TMP"
+    [[ -n "$DMG_STAGE" ]] && rm -rf "$DMG_STAGE"
     if [[ -n "$DMG_MOUNT" ]]; then
         hdiutil detach -quiet "$DMG_MOUNT" >/dev/null 2>&1 \
             || hdiutil detach -force -quiet "$DMG_MOUNT" >/dev/null 2>&1 \
@@ -992,11 +1003,16 @@ echo "Bundle complete: $APP"
 T_STEP=$SECONDS
 mkdir -p "$OUTPUT_DIR"
 DMG="$OUTPUT_DIR/pilot.dmg"
-echo "==> Creating $DMG from $APP"
+DMG_STAGE=$(mktemp -d -t solvcon-dmg-stage)
+ditto "$APP" "$DMG_STAGE/$(basename "$APP")"
+ln -s /Applications "$DMG_STAGE/Applications"
+echo "==> Creating $DMG from $APP with an Applications shortcut"
 hdiutil create -volname "solvcon Pilot" \
-    -srcfolder "$APP" \
+    -srcfolder "$DMG_STAGE" \
     -ov -format UDZO \
     "$DMG"
+rm -rf "$DMG_STAGE"
+DMG_STAGE=""
 SIZE=$(du -sh "$DMG" | cut -f1)
 echo "    [Step 8 (Package DMG): $((SECONDS - T_STEP))s]"
 
@@ -1090,6 +1106,7 @@ if [[ $SKIP_CHECK -eq 0 ]]; then
     echo "==> Mounting $DMG at $DMG_MOUNT"
     hdiutil attach -nobrowse -readonly -mountpoint "$DMG_MOUNT" "$DMG" \
         >/dev/null
+    verify_applications_shortcut "$DMG_MOUNT"
 
     DMG_APP=$(find "$DMG_MOUNT" -maxdepth 2 -name '*.app' -type d -print -quit)
     [[ -n "$DMG_APP" ]] || { echo "ERROR: no .app found in $DMG" >&2; exit 1; }
