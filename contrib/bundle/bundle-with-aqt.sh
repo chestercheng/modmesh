@@ -62,6 +62,7 @@ fail() { printf 'FAIL  %s\n' "$*" >&2; return 1; }
 
 require_macos() {
     [[ "$(uname -s)" == "Darwin" ]] || fail "macOS is required for macOS bundle release"
+    [[ "$(uname -m)" == "arm64" ]] || fail "Apple Silicon is required for macOS bundle release"
 }
 
 setup_hint() {

@@ -19,22 +19,13 @@ AQT_CONFIG=${AQT_CONFIG:-$BUNDLE_REPO_ROOT/thirdparty/aqt_settings.ini}
     exit 1
 }
 
-case "$(uname -m)" in
-    arm64)
-        arch=aarch64
-        sha=0211ccf04c5e0a0feb0b9bf1148030e1f6a31b8eae624f13919a7752a4e3dc79
-        ;;
-    x86_64)
-        arch=x86_64
-        sha=18b12f5836c6a5cee8223f1759d26bd3174c1271bb3b7882dc09e2d961f3c863
-        ;;
-    *)
-        echo "unsupported macOS architecture: $(uname -m)" >&2
-        exit 1
-        ;;
-esac
+[[ "$(uname -m)" == "arm64" ]] || {
+    echo "Apple Silicon macOS is required for macOS bundle dependencies" >&2
+    exit 1
+}
 
-archive="cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-${arch}-apple-darwin-install_only.tar.gz"
+sha=0211ccf04c5e0a0feb0b9bf1148030e1f6a31b8eae624f13919a7752a4e3dc79
+archive="cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-aarch64-apple-darwin-install_only.tar.gz"
 url="https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_RELEASE/$archive"
 tmp=$(mktemp -d -t solvcon-bundle-deps)
 trap 'rm -rf "$tmp"' EXIT
