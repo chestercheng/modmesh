@@ -133,7 +133,7 @@ check_deps() {
     ok "tools prefix: $TOOLS_PREFIX"
 
     for cmd in cmake make python3 macdeployqt qtpaths otool \
-        install_name_tool codesign ditto hdiutil readlink rsync shasum; do
+        install_name_tool strip codesign ditto hdiutil readlink rsync shasum; do
         require_command "$cmd" || failed=1
     done
 
@@ -512,9 +512,10 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     # `make pilot` only re-links the binary; remove the .app so the
     # build produces a virgin one each run.
     rm -rf "$APP"
-    echo "==> make pilot BUILD_PATH=$BUILD_PATH"
+    echo "==> make pilot CMAKE_BUILD_TYPE=Release BUILD_PATH=$BUILD_PATH"
     PYBIND11_CMAKE_DIR=$("$TOOLS_PREFIX/bin/python3" -m pybind11 --cmakedir)
-    env -u CMAKE_PREFIX_PATH make -W CMakeLists.txt pilot BUILD_PATH="$BUILD_PATH" \
+    env -u CMAKE_PREFIX_PATH make -W CMakeLists.txt pilot \
+        CMAKE_BUILD_TYPE=Release BUILD_PATH="$BUILD_PATH" \
         CMAKE_ARGS="${CMAKE_ARGS:-} --fresh -DCMAKE_PREFIX_PATH=\"$PREFIX\" -DQt6_DIR=\"$PREFIX/lib/cmake/Qt6\" -DPYTHON_EXECUTABLE=\"$PREFIX/bin/python3\" -Dpybind11_DIR=\"$PYBIND11_CMAKE_DIR\""
 fi
 
@@ -560,6 +561,8 @@ T_STEP=$SECONDS
 echo "==> Copying Python packages into bundled site-packages"
 for SITE in "${SITE_DIRS[@]}"; do
     rsync -aL --exclude '__pycache__' --exclude '*.pth' \
+        --exclude 'test/' --exclude 'tests/' \
+        --exclude 'examples/' --exclude 'benchmarks/' \
         --exclude 'solvcon' --exclude '_solvcon*.so' \
         --exclude 'pip' --exclude 'pip-*.dist-info' \
         --exclude 'setuptools' --exclude 'setuptools-*.dist-info' \
@@ -568,6 +571,10 @@ for SITE in "${SITE_DIRS[@]}"; do
         "$SITE/" "$BUNDLED_SITE/"
 done
 rm -rf "$BUNDLED_SITE/PySide6/scripts"
+rm -rf "$BUNDLED_SITE/PySide6/include" \
+    "$BUNDLED_SITE/shiboken6/include" \
+    "$BUNDLED_SITE/numpy/_core/include" \
+    "$BUNDLED_SITE/numpy/core/include"
 echo "    [Step 4 (Bundle site-packages): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
@@ -932,6 +939,9 @@ dedupe_pyside_qt
 echo "==> Setting PYTHONNOUSERSITE=1 in Info.plist"
 inject_pythonnousersite
 echo "    [Step 6 (Vendor prefix deps): $((SECONDS - T_STEP))s]"
+
+echo "==> Stripping debug and local symbols from pilot"
+strip -S -x "$BINARY"
 
 # ---------------------------------------------------------------------------
 # Step 7: Ad-hoc codesign
