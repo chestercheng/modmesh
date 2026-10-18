@@ -109,6 +109,16 @@ set_target_properties(
 )
 
 if(APPLE)
+    set_target_properties(
+        pilot PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in
+        MACOSX_BUNDLE_GUI_IDENTIFIER net.solvcon.pilot
+        MACOSX_BUNDLE_BUNDLE_NAME "solvcon Pilot"
+        MACOSX_BUNDLE_BUNDLE_VERSION 1
+        MACOSX_BUNDLE_SHORT_VERSION_STRING 0.0.0
+        MACOSX_BUNDLE_COPYRIGHT "Copyright (c) 2026, solvcon team"
+    )
+
     find_library(APPLE_FWK_QUARTZ_CORE QuartzCore REQUIRED)
 
     target_link_libraries(

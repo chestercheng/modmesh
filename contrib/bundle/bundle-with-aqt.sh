@@ -544,7 +544,8 @@ echo "    [Step 1 (Build pilot): $((SECONDS - T_STEP))s]"
 
 T_STEP=$SECONDS
 echo "==> macdeployqt (bundles Qt frameworks, plugins, transitive dylibs)"
-macdeployqt "$APP" -verbose=1 -libpath="$PREFIX/lib"
+# Later steps modify the deployed files, so sign the finished bundle once.
+macdeployqt "$APP" -verbose=1 -no-codesign -libpath="$PREFIX/lib"
 for plugin_dir in "$APP"/Contents/PlugIns/*/; do
     [[ -d "$plugin_dir" ]] || continue
     plugin_name=$(basename "$plugin_dir")
@@ -972,7 +973,7 @@ echo "    [Step 6 (Vendor prefix deps): $((SECONDS - T_STEP))s]"
 sign_inner_machos() {
     local BIN
     while IFS= read -r -d '' BIN; do
-        codesign --force --sign - "$BIN" 2>/dev/null || true
+        codesign --force --sign - "$BIN"
     done < <(find "$APP/Contents" \( -name '*.dylib' -o -name '*.so' \) -print0)
 }
 
@@ -985,7 +986,7 @@ sign_helper_apps() {
         sort -k1,1nr | cut -d' ' -f2- | while IFS= read -r INNER_APP; do
         [[ "$INNER_APP" == "$APP" ]] && continue
         rm -rf "$INNER_APP/Contents/_CodeSignature"
-        codesign --force --sign - "$INNER_APP" 2>/dev/null || true
+        codesign --force --sign - "$INNER_APP"
     done
 }
 
@@ -998,7 +999,7 @@ sign_frameworks() {
         for VER in "$FW"/Versions/*; do
             [[ -d "$VER" && ! -L "$VER" ]] || continue
             rm -rf "$VER/_CodeSignature"
-            codesign --force --sign - "$VER" 2>/dev/null || true
+            codesign --force --sign - "$VER"
         done
     done
 }
@@ -1016,6 +1017,7 @@ sign_helper_apps
 sign_frameworks
 echo "==> Ad-hoc re-signing the app bundle"
 sign_main_app
+codesign --verify --deep --strict "$APP"
 echo "    [Step 7 (Ad-hoc codesign): $((SECONDS - T_STEP))s]"
 
 echo ""
