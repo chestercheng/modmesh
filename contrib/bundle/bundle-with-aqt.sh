@@ -6,19 +6,17 @@
 # codesign to reseal them.
 #
 # !! WARNING !!
-# The script is only tested in a standalone VM environment, and assumes the
-# dependencies are from homebrew. Be very careful when running it in a
-# development or production machine.
+# The script assumes dependencies were installed by prepare-with-aqt.sh.
 #
 # Usage:
-#   ./contrib/bundle/bundle-with-homebrew.sh check
-#   ./contrib/bundle/bundle-with-homebrew.sh bundle [--skip-build]
+#   ./contrib/bundle/bundle-with-aqt.sh check
+#   ./contrib/bundle/bundle-with-aqt.sh bundle [--skip-build]
 #                                                   [--skip-check]
 #                                                   [--output DIR]
-#   ./contrib/bundle/bundle-with-homebrew.sh verify path/to/pilot.dmg
+#   ./contrib/bundle/bundle-with-aqt.sh verify path/to/pilot.dmg
 #
 # Legacy usage without a subcommand still runs the bundle step:
-#   ./contrib/bundle/bundle-with-homebrew.sh [--skip-build] [--skip-check]
+#   ./contrib/bundle/bundle-with-aqt.sh [--skip-build] [--skip-check]
 #                                            [--output DIR]
 #
 #   --skip-build   Skip `make pilot` and use the existing build output.
@@ -32,7 +30,11 @@ BUNDLE_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$BUNDLE_REPO_ROOT"
 
 MIN_LOADS=${MIN_LOADS:-50}
-HOST_PREFIX_RE='^(/opt/homebrew|/usr/local)'
+QT_VERSION=6.11.1
+PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/sdk/$QT_VERSION/macos"
+TOOLS_PREFIX="$BUNDLE_REPO_ROOT/build/bundle-deps/tools"
+HOST_PREFIX_RE="^(${PREFIX//./\.}|${TOOLS_PREFIX//./\.})"
+export PATH="$PREFIX/bin:$TOOLS_PREFIX/bin:$PATH"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,14 +43,14 @@ HOST_PREFIX_RE='^(/opt/homebrew|/usr/local)'
 usage() {
     cat <<'EOF'
 Usage:
-  contrib/bundle/bundle-with-homebrew.sh check
-  contrib/bundle/bundle-with-homebrew.sh bundle [--skip-build] [--skip-check] [--output DIR]
-  contrib/bundle/bundle-with-homebrew.sh verify path/to/pilot.dmg
-  contrib/bundle/bundle-with-homebrew.sh all [--skip-build] [--skip-check] [--output DIR]
+  contrib/bundle/bundle-with-aqt.sh check
+  contrib/bundle/bundle-with-aqt.sh bundle [--skip-build] [--skip-check] [--output DIR]
+  contrib/bundle/bundle-with-aqt.sh verify path/to/pilot.dmg
+  contrib/bundle/bundle-with-aqt.sh all [--skip-build] [--skip-check] [--output DIR]
 
 Subcommands:
   check    Check macOS bundle release dependencies. Does not build or install.
-  bundle   Build/package pilot.app and pilot.dmg with Homebrew dependencies.
+  bundle   Build/package pilot.app and pilot.dmg with aqt dependencies.
   verify   Verify a generated release DMG artifact.
   all      Run check and then bundle. (No verify.)
 EOF
@@ -65,22 +67,9 @@ require_macos() {
 setup_hint() {
     cat >&2 <<'EOF'
 
-For a fresh macOS bundling environment, try:
-  bash contrib/vm/macos/mac26_vmsetup.sh homebrew
-  bash contrib/vm/macos/mac26_vmsetup.sh dependency
+Prepare the bundle dependencies, then retry:
+  ./contrib/bundle/prepare-with-aqt.sh
 EOF
-}
-
-find_brew() {
-    if command -v brew >/dev/null 2>&1; then
-        command -v brew
-    elif [[ -x /opt/homebrew/bin/brew ]]; then
-        printf '%s\n' /opt/homebrew/bin/brew
-    elif [[ -x /usr/local/bin/brew ]]; then
-        printf '%s\n' /usr/local/bin/brew
-    else
-        return 1
-    fi
 }
 
 require_command() {
@@ -117,79 +106,45 @@ PY
     fi
 }
 
-python_framework_check() {
-    python3 <<'PY'
-import os
-import sys
-import sysconfig
-
-fw = sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX")
-if not fw:
-    raise SystemExit("PYTHONFRAMEWORKPREFIX is empty; Homebrew framework Python is required")
-ver = f"{sys.version_info[0]}.{sys.version_info[1]}"
-path = os.path.join(fw, "Python.framework", "Versions", ver, "Python")
-if not os.path.isfile(path):
-    raise SystemExit(f"Python dylib not found: {path}")
-print(path)
-PY
+python_dylib_check() {
+    local path="$PREFIX/lib/libpython$(bundle_pyver).dylib"
+    [[ -f "$path" ]] || return 1
+    printf '%s\n' "$path"
 }
 
 check_pybind11_cmake() {
-    local config_dir prefix
-    if command -v pybind11-config >/dev/null 2>&1; then
-        config_dir=$(pybind11-config --cmakedir 2>/dev/null || true)
-        if [[ -n "$config_dir" && -f "$config_dir/pybind11Config.cmake" ]]; then
-            ok "pybind11 CMake config: $config_dir/pybind11Config.cmake"
-            return 0
-        fi
-    fi
-    prefix=$(brew --prefix pybind11 2>/dev/null || true)
-    if [[ -n "$prefix" && -f "$prefix/share/cmake/pybind11/pybind11Config.cmake" ]]; then
-        ok "pybind11 CMake config: $prefix/share/cmake/pybind11/pybind11Config.cmake"
+    local config_dir
+    config_dir=$("$TOOLS_PREFIX/bin/python3" -m pybind11 --cmakedir 2>/dev/null || true)
+    if [[ -n "$config_dir" && -f "$config_dir/pybind11Config.cmake" ]]; then
+        ok "pybind11 CMake config: $config_dir/pybind11Config.cmake"
     else
-        fail "pybind11 CMake config: not found (brew install pybind11)"
+        fail "pybind11 CMake config: not found under $TOOLS_PREFIX"
     fi
 }
 
 check_deps() {
-    local brew_exe brew_prefix python_path fw_path failed=0
+    local dylib_path failed=0
     require_macos
 
-    if brew_exe=$(find_brew); then
-        ok "brew: $brew_exe"
-        eval "$("$brew_exe" shellenv)"
-        brew_prefix=$(brew --prefix)
-        ok "Homebrew prefix: $brew_prefix"
-    else
-        fail "brew: not found (install Homebrew)" || true
-        setup_hint
-        exit 1
-    fi
+    ok "SDK prefix: $PREFIX"
+    ok "tools prefix: $TOOLS_PREFIX"
 
     for cmd in cmake make python3 macdeployqt qtpaths otool \
         install_name_tool codesign hdiutil rsync shasum; do
         require_command "$cmd" || failed=1
     done
 
-    python_path=$(command -v python3 || true)
-    if [[ -n "$python_path" && "$python_path" == "$brew_prefix"/* ]]; then
-        ok "python3 is under Homebrew prefix"
+    if dylib_path=$(python_dylib_check 2>&1); then
+        ok "Python dylib: $dylib_path"
     else
-        fail "python3 is not from Homebrew prefix ($python_path; expected under $brew_prefix)" || failed=1
-    fi
-
-    if fw_path=$(python_framework_check 2>&1); then
-        ok "Python framework dylib: $fw_path"
-    else
-        fail "$fw_path" || failed=1
+        fail "Python dylib not found under $PREFIX/lib" || failed=1
     fi
 
     check_pybind11_cmake || failed=1
-    python_module_check numpy "brew install numpy" || failed=1
-    python_module_check PySide6 "brew install pyside" || failed=1
-    python_module_check shiboken6 "brew install pyside" || failed=1
-    python_module_check shiboken6_generator "brew install pyside" || failed=1
-    python_module_check matplotlib "brew install python-matplotlib" || failed=1
+    python_module_check numpy || failed=1
+    python_module_check PySide6 || failed=1
+    python_module_check shiboken6 || failed=1
+    python_module_check matplotlib || failed=1
 
     if [[ $failed -ne 0 ]]; then
         setup_hint
@@ -197,15 +152,15 @@ check_deps() {
     fi
 }
 
-# Active Python's "X.Y" version string.
+# SDK Python's "X.Y" version string.
 bundle_pyver() {
     python3 -c "import sys; print('%d.%d' % sys.version_info[:2])"
 }
 
 # Print every Mach-O under $1, NUL-delimited: standalone dylibs, .so
 # extensions, MacOS/ binaries, and the main binary of every nested framework.
-# Framework binaries cannot be matched by file mode -- Homebrew ships them as
-# 0644 -- so synthesise the canonical path (Versions/<v>/<name>) explicitly.
+# Framework binaries cannot be matched by file mode, so synthesise the
+# canonical path (Versions/<v>/<name>) explicitly.
 list_macho() {
     find "$1" -name '*.framework' -type d -print0 | \
         while IFS= read -r -d '' fw; do
@@ -241,7 +196,7 @@ binary_rpaths() {
     '
 }
 
-# Verify the .app under $1 contains no surviving Homebrew prefix reference
+# Verify the .app under $1 contains no surviving dependency prefix reference
 # with both LC_LOAD_DYLIB-style commands (visible via otool -L) and LC_RPATH
 # search paths. Print offenders. Return 0 if clean and 1 otherwise.
 check_self_contained() {
@@ -259,10 +214,10 @@ check_self_contained() {
         fi
     done < <(list_macho "$1")
     if [[ $bad -eq 0 ]]; then
-        echo "    OK: $total Mach-O files, none reference /opt/homebrew or /usr/local"
+        echo "    OK: $total Mach-O files, none reference the dependency prefixes"
         return 0
     fi
-    echo "ERROR: $bad of $total Mach-O files still reference Homebrew prefixes" >&2
+    echo "ERROR: $bad of $total Mach-O files still reference dependency prefixes" >&2
     return 1
 }
 
@@ -308,9 +263,9 @@ smoke_launch_verify() {
         sed -n '1,80p' "$trace" >&2
         return 1
     fi
-    if grep -E '^dyld\[' "$trace" | grep -E '/opt/homebrew|/usr/local' >/dev/null; then
+    if grep -E '^dyld\[' "$trace" | grep -E "${HOST_PREFIX_RE#^}" >/dev/null; then
         echo "ERROR: smoke launch loaded libraries from host package prefixes:" >&2
-        grep -E '^dyld\[' "$trace" | grep -E '/opt/homebrew|/usr/local' | head -20 >&2
+        grep -E '^dyld\[' "$trace" | grep -E "${HOST_PREFIX_RE#^}" | head -20 >&2
         return 1
     fi
     echo "    OK: $loaded libraries loaded, none from host package prefixes"
@@ -480,23 +435,14 @@ APP="$BUNDLE_REPO_ROOT/$BUILD_PATH/cpp/binary/pilot/pilot.app"
 BINARY="$APP/Contents/MacOS/pilot"
 FW_DIR="$APP/Contents/Frameworks"
 
-# Locate the Python framework used at build time.
-PY_FW=$(python3 -c "
-import sys, os, sysconfig
-fw = sysconfig.get_config_var('PYTHONFRAMEWORKPREFIX')
-if fw:
-    print(os.path.join(fw, 'Python.framework'))
-else:
-    base = os.path.dirname(os.path.dirname(sys.executable))
-    print(os.path.join(base, 'Frameworks', 'Python.framework'))
-")
-PY_DYLIB="$PY_FW/Versions/$PY_VER/Python"
-NEW_PY_PATH="@executable_path/../Frameworks/Python.framework/Versions/$PY_VER/Python"
+PY_DYLIB="$PREFIX/lib/libpython${PY_VER}.dylib"
+PY_STDLIB="$PREFIX/lib/python${PY_VER}"
+BUNDLED_LIB="$APP/Contents/lib/python${PY_VER}"
+BUNDLED_SITE="$BUNDLED_LIB/site-packages"
 
 # Every site-packages dir the embedded interpreter would search, expanded
-# through .pth files (so packages installed under separate Homebrew prefixes
-# such as the matplotlib keg are found). macOS bash 3.2 has no mapfile; read
-# into an array with a loop.
+# through .pth files. macOS bash 3.2 has no mapfile; read into an array with a
+# loop.
 SITE_DIRS=()
 while IFS= read -r line; do
     SITE_DIRS+=("$line")
@@ -538,7 +484,8 @@ done < <(python3 -c "
 import importlib, os, sys
 seeds = os.environ.get('BUNDLE_SEED_MODULES',
     'PySide6.QtCore,PySide6.QtWidgets,PySide6.QtGui,numpy,matplotlib,'
-    'dateutil.relativedelta,dateutil.tz,dateutil.parser').split(',')
+    'dateutil.relativedelta,dateutil.tz,dateutil.parser,jsonschema,'
+    'zstandard,lz4.frame').split(',')
 extras = os.environ.get('BUNDLE_EXTRA_PACKAGES', '').split(',')
 for m in seeds + extras:
     m = m.strip()
@@ -562,7 +509,7 @@ print('\n'.join(sorted(out)))
 
 echo "==> Build path : $BUILD_PATH"
 echo "==> App bundle : $APP"
-echo "==> Python fw  : $PY_FW"
+echo "==> Python     : $PY_DYLIB"
 for d in "${SITE_DIRS[@]}"; do
     echo "==> site-pkgs  : $d"
 done
@@ -582,7 +529,9 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     # build produces a virgin one each run.
     rm -rf "$APP"
     echo "==> make pilot BUILD_PATH=$BUILD_PATH"
-    make pilot BUILD_PATH="$BUILD_PATH"
+    PYBIND11_CMAKE_DIR=$("$TOOLS_PREFIX/bin/python3" -m pybind11 --cmakedir)
+    env -u CMAKE_PREFIX_PATH make -W CMakeLists.txt pilot BUILD_PATH="$BUILD_PATH" \
+        CMAKE_ARGS="${CMAKE_ARGS:-} --fresh -DCMAKE_PREFIX_PATH=\"$PREFIX\" -DQt6_DIR=\"$PREFIX/lib/cmake/Qt6\" -DPYTHON_EXECUTABLE=\"$PREFIX/bin/python3\" -Dpybind11_DIR=\"$PYBIND11_CMAKE_DIR\""
 fi
 
 [[ -f "$BINARY" ]] || { echo "ERROR: pilot binary not found at $BINARY" >&2; exit 1; }
@@ -594,35 +543,29 @@ echo "    [Step 1 (Build pilot): $((SECONDS - T_STEP))s]"
 
 T_STEP=$SECONDS
 echo "==> macdeployqt (bundles Qt frameworks, plugins, transitive dylibs)"
-# macdeployqt looks for sibling frameworks under <prefix>/lib/, but Homebrew
-# puts Python.framework under <prefix>/Frameworks/. This triggers two cosmetic
-# ERROR lines (exit 0; Qt deployment unaffected; Step 3 bundles Python
-# ourselves). Filter just those lines; pipefail keeps real failures visible.
-macdeployqt "$APP" -verbose=1 2>&1 | sed -E \
-    -e '/^ERROR: .*otool-classic: can.t open file: .*lib\/Python\.framework.*No such file or directory/d' \
-    -e '/^ERROR: no file at ".*lib\/Python\.framework/d'
+macdeployqt "$APP" -verbose=1 -libpath="$PREFIX/lib"
+for plugin_dir in "$APP"/Contents/PlugIns/*/; do
+    [[ -d "$plugin_dir" ]] || continue
+    plugin_name=$(basename "$plugin_dir")
+    ln -sfn "../PlugIns/$plugin_name" "$APP/Contents/MacOS/$plugin_name"
+done
 echo "    [Step 2 (Deploy Qt): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
-# Step 3: Bundle Python framework
+# Step 3: Bundle Python runtime
 # ---------------------------------------------------------------------------
 
 T_STEP=$SECONDS
-echo "==> Bundling Python.framework"
-
-DEST_FW="$FW_DIR/Python.framework"
-rm -rf "$DEST_FW"
-cp -R "$PY_FW" "$DEST_FW"
-
-install_name_tool -change "$PY_DYLIB" "$NEW_PY_PATH" "$BINARY"
-echo "    Python -> $NEW_PY_PATH"
-
-# site-packages inside the framework is a symlink into Cellar; replace with a
-# real directory so subsequent steps can drop packages in.
-BUNDLED_SITE="$DEST_FW/Versions/$PY_VER/lib/python${PY_VER}/site-packages"
-rm -rf "$BUNDLED_SITE"
+echo "==> Bundling Python runtime"
+mkdir -p "$FW_DIR" "$BUNDLED_LIB"
+cp -L "$PY_DYLIB" "$FW_DIR/"
+chmod u+w "$FW_DIR/$(basename "$PY_DYLIB")"
+rsync -aL --exclude '__pycache__' --exclude 'site-packages' \
+    --exclude 'test' --exclude 'tkinter' --exclude '_tkinter*.so' \
+    --exclude 'idlelib' --exclude 'turtledemo' --exclude 'ensurepip' \
+    --exclude 'config-*' "$PY_STDLIB/" "$BUNDLED_LIB/"
 mkdir -p "$BUNDLED_SITE"
-echo "    [Step 3 (Bundle Python framework): $((SECONDS - T_STEP))s]"
+echo "    [Step 3 (Bundle Python runtime): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
 # Step 4: Bundle site-packages
@@ -676,9 +619,8 @@ echo "    [Step 5 (Bundle solvcon): $((SECONDS - T_STEP))s]"
 # mtime drift from rsync/DMG creation that would otherwise let the default
 # timestamp mode falsely invalidate the cache at runtime.
 #
-# Target the whole lib/python<ver> tree so both the stdlib (which Step 3
-# copied in via `cp -R`, including Homebrew's timestamp-mode .pyc) and the
-# rsynced site-packages get a uniform unchecked-hash cache. The `-f` flag
+# Target the whole lib/python<ver> tree so both the stdlib and the rsynced
+# site-packages get a uniform unchecked-hash cache. The `-f` flag
 # forces rewrite over the inherited stdlib .pyc.
 #
 # Drop lib/python<ver>/test first: CPython's own test suite is not used at
@@ -692,9 +634,9 @@ echo "    [Step 5 (Bundle solvcon): $((SECONDS - T_STEP))s]"
 
 T_STEP=$SECONDS
 echo "==> Pre-compiling bundled Python modules"
-PY_LIB="$DEST_FW/Versions/$PY_VER/lib/python$PY_VER"
+PY_LIB="$BUNDLED_LIB"
 rm -rf "$PY_LIB/test"
-"$DEST_FW/Versions/$PY_VER/bin/python$PY_VER" -m compileall -f \
+python3 -m compileall -f \
     --invalidation-mode unchecked-hash -q \
     "$PY_LIB" || true
 PYC_COUNT=$(find "$PY_LIB" -name '*.pyc' | wc -l | tr -d ' ')
@@ -704,21 +646,19 @@ echo "    compiled $PYC_COUNT .pyc files"
 echo "    [Step 5.5 (Pre-compile bytecode): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
-# Step 6: Vendor Homebrew deps
+# Step 6: Vendor prefix deps
 #
 # macdeployqt only follows Qt's load commands, so other dependencies (Python's
 # lib-dynload .so files, libpyside6, libshiboken6, etc.) still resolve through
-# /opt/homebrew at runtime. Walk every Mach-O in the bundle, copy missing
-# /opt/homebrew dylibs/frameworks into Contents/Frameworks/, rewrite load
-# commands and LC_ID_DYLIB to the bundled copy, and strip /opt/homebrew from
-# LC_RPATH.
+# the SDK prefix at runtime. Copy them into Contents/Frameworks/ and rewrite
+# their load commands and LC_RPATH entries.
 # ---------------------------------------------------------------------------
 
-# BFS-walk every Mach-O in the bundle: pop one, copy any missing /opt/homebrew
+# BFS-walk every Mach-O in the bundle: pop one, copy any missing prefix
 # dependency into Contents/Frameworks/, enqueue what we just copied. Touching
 # each file once keeps cost linear in bundle size. Sets the global SEEN_DYLIB /
 # SEEN_FW indexes consumed by rewrite_load_commands below.
-vendor_homebrew_deps() {
+vendor_prefix_deps() {
     CLOSURE_TMP=$(mktemp -d)
     QUEUE="$CLOSURE_TMP/queue"
     SEEN_BIN="$CLOSURE_TMP/seen_bin"
@@ -746,7 +686,7 @@ vendor_homebrew_deps() {
         echo "$BIN" >> "$SEEN_BIN"
         while IFS= read -r OLD; do
             case "$OLD" in
-            /opt/homebrew/*.framework/Versions/*/*)
+            "$PREFIX"/*.framework/Versions/*/*)
                 fw=${OLD##*/}
                 grep -qxF "$fw" "$SEEN_FW" && continue
                 SRC=${OLD%%/Versions/*}
@@ -771,7 +711,7 @@ vendor_homebrew_deps() {
                         | xargs -0 -n1 echo >> "$QUEUE"
                 fi
                 ;;
-            /opt/homebrew/*)
+            "$PREFIX"/*)
                 base=${OLD##*/}
                 grep -qxF "$base" "$SEEN_DYLIB" && continue
                 if [[ ! -f "$OLD" ]]; then
@@ -790,23 +730,22 @@ vendor_homebrew_deps() {
                 fi
                 ;;
             @rpath/lib*.dylib|@loader_path/lib*.dylib)
-                # Sibling references like libgfortran -> @rpath/
-                # libgcc_s.1.1.dylib, where Homebrew ships the sibling next to
-                # the loader under one of its keg paths.
+                # Sibling references such as @rpath/libpyside6.abi3.6.11.dylib.
                 base=${OLD##*/}
                 grep -qxF "$base" "$SEEN_DYLIB" && continue
+                [[ "$OLD" == @loader_path/* && -f "$(dirname "$BIN")/${OLD#@loader_path/}" ]] && continue
                 SRC=""
                 for cand in \
-                    "/opt/homebrew/lib/$base" \
-                    /opt/homebrew/opt/*/lib/"$base" \
-                    /opt/homebrew/opt/*/lib/gcc/current/"$base"
+                    "$PREFIX/lib/$base" \
+                    "$PREFIX/lib/python${PY_VER}/site-packages/PySide6/$base" \
+                    "$PREFIX/lib/python${PY_VER}/site-packages/shiboken6/$base"
                 do
                     [[ -f "$cand" ]] && { SRC="$cand"; break; }
                 done
                 if [[ -z "$SRC" ]]; then
                     if ! grep -qxF "$OLD" "$SEEN_MISSING"; then
                         echo "$OLD" >> "$SEEN_MISSING"
-                        echo "    WARN: could not resolve $OLD under /opt/homebrew" >&2
+                        echo "    WARN: could not resolve $OLD under $PREFIX" >&2
                     fi
                     continue
                 fi
@@ -826,7 +765,7 @@ $(wc -l < "$SEEN_FW" | tr -d ' ') frameworks"
 
 # Rewrite every Mach-O reference whose target is now bundled (load commands,
 # LC_ID_DYLIB, and the two Python re-export stubs that hard-code the original
-# Python path). Reads SEEN_DYLIB / SEEN_FW populated by vendor_homebrew_deps.
+# Python path). Reads SEEN_DYLIB / SEEN_FW populated by vendor_prefix_deps.
 rewrite_load_commands() {
     # Surrounding spaces let bash do containment with the *" $tok "* glob.
     local INDEX FW_INDEX
@@ -837,7 +776,7 @@ rewrite_load_commands() {
     while IFS= read -r -d '' BIN; do
         while IFS= read -r OLD; do
             case "$OLD" in
-            /opt/homebrew/*.framework/Versions/*/*)
+            "$PREFIX"/*.framework/Versions/*/*)
                 fw=${OLD##*/}
                 if [[ "$FW_INDEX" == *" $fw "* ]]; then
                     # Preserve the original version segment.
@@ -846,7 +785,7 @@ rewrite_load_commands() {
                     install_name_tool -change "$OLD" "$NEW" "$BIN" 2>/dev/null || true
                 fi
                 ;;
-            /opt/homebrew/*)
+            "$PREFIX"/*)
                 base=${OLD##*/}
                 if [[ "$INDEX" == *" $base "* ]]; then
                     NEW="@executable_path/../Frameworks/$base"
@@ -865,7 +804,7 @@ rewrite_load_commands() {
     done < <(list_macho "$APP")
 
     # Each bundled dylib/framework's own LC_ID_DYLIB still names its original
-    # Homebrew path; rewrite so dyld dedupes by install name.
+    # prefix path; rewrite so dyld dedupes by install name.
     local f fw_path name vname bin_path VER
     for f in "$FW_DIR"/*.dylib; do
         [[ -f "$f" ]] || continue
@@ -887,42 +826,33 @@ rewrite_load_commands() {
         done
     done
 
-    # Two re-export stubs inside Python.framework still hard-code the original
-    # Homebrew Python path. Redirect them to the bundled copy.
-    for f in \
-        "$DEST_FW/Versions/$PY_VER/lib/libpython${PY_VER}.dylib" \
-        "$DEST_FW/Versions/$PY_VER/lib/python${PY_VER}/config-${PY_VER}-darwin/libpython${PY_VER}.dylib"
-    do
-        [[ -f "$f" ]] || continue
-        install_name_tool -change "$PY_DYLIB" "$NEW_PY_PATH" "$f" 2>/dev/null || true
-    done
 }
 
 # LC_RPATH is invisible to otool -L so the rewrite above missed it. A surviving
-# /opt/homebrew rpath silently falls back at runtime on Homebrew machines and
-# fails everywhere else. For each affected Mach-O: add
+# prefix rpath silently falls back at runtime on the build machine and fails
+# everywhere else. For each affected Mach-O: add
 # @executable_path/../Frameworks (so bundled siblings stay reachable via
-# @rpath/), then delete every /opt/homebrew entry one at a time
+# @rpath/), then delete every prefix entry one at a time
 # (install_name_tool removes one per call).
-strip_homebrew_rpaths() {
+strip_prefix_rpaths() {
     local EP_RPATH='@executable_path/../Frameworks'
-    local BIN homebrew_rps rp
+    local BIN prefix_rps rp
     while IFS= read -r -d '' BIN; do
-        homebrew_rps=$(binary_rpaths "$BIN" | grep -E '^/opt/homebrew' || true)
-        [[ -z "$homebrew_rps" ]] && continue
+        prefix_rps=$(binary_rpaths "$BIN" | grep -E "$HOST_PREFIX_RE" || true)
+        [[ -z "$prefix_rps" ]] && continue
         if ! binary_rpaths "$BIN" | grep -qxF "$EP_RPATH"; then
             install_name_tool -add_rpath "$EP_RPATH" "$BIN" 2>/dev/null || true
         fi
         while IFS= read -r rp; do
             [[ -z "$rp" ]] && continue
             install_name_tool -delete_rpath "$rp" "$BIN" 2>/dev/null || true
-        done <<< "$homebrew_rps"
+        done <<< "$prefix_rps"
     done < <(list_macho "$APP")
 }
 
-# Drop any Mach-O still referencing /opt/homebrew after vendor + rewrite have
-# run -- typically Qt plugins (e.g. PySide6's sqldrivers) pre-linked against
-# Homebrew kegs not installed on this host. dyld would fail to load them
+# Drop any Mach-O still referencing the SDK prefix after vendor + rewrite have
+# run, typically Qt plugins pre-linked against libraries absent from the SDK.
+# dyld would fail to load them
 # anyway. Skips framework MAIN binaries since removing those breaks the
 # framework structure; that case is better surfaced by the static check.
 prune_unfixable_machos() {
@@ -940,8 +870,8 @@ prune_unfixable_machos() {
             ;;
         esac
         load_refs=$(otool -L "$BIN" 2>/dev/null | tail -n +2 | awk '{print $1}' \
-            | grep -E '^/opt/homebrew' || true)
-        rpath_refs=$(binary_rpaths "$BIN" | grep -E '^/opt/homebrew' || true)
+            | grep -E "$HOST_PREFIX_RE" || true)
+        rpath_refs=$(binary_rpaths "$BIN" | grep -E "$HOST_PREFIX_RE" || true)
         if [[ -n "$load_refs" || -n "$rpath_refs" ]]; then
             rm -f "$BIN"
             echo "    WARN: pruned ${BIN#"$APP/"}" >&2
@@ -952,7 +882,7 @@ prune_unfixable_machos() {
         # Stderr + WARN prefix: each pruned file is a feature pilot loses on
         # this host, even if startup smoke-launch still passes. User can
         # install the missing keg and rerun to keep it.
-        echo "    WARN: pruned $count Mach-O file(s) with unresolvable /opt/homebrew deps" >&2
+        echo "    WARN: pruned $count Mach-O file(s) with unresolvable prefix deps" >&2
     fi
 }
 
@@ -965,17 +895,17 @@ prune_unfixable_machos() {
 # in place; their @rpath/QtCore... refs resolve through these symlinks too.
 dedupe_pyside_qt() {
     local pyqt_lib count=0 nested name main rel
-    pyqt_lib="$DEST_FW/Versions/$PY_VER/lib/python${PY_VER}/site-packages/PySide6/Qt/lib"
+    pyqt_lib="$BUNDLED_SITE/PySide6/Qt/lib"
     [[ -d "$pyqt_lib" ]] || return 0
-    # 9 levels: PySide6/Qt/lib up to Contents/Frameworks/.
-    rel='../../../../../../../../..'
+    # Six levels: PySide6/Qt/lib up to Contents/.
+    rel='../../../../../..'
     for nested in "$pyqt_lib"/Qt*.framework; do
         [[ -d "$nested" && ! -L "$nested" ]] || continue
         name=$(basename "$nested" .framework)
         main="$FW_DIR/${name}.framework"
         [[ -d "$main" && ! -L "$main" ]] || continue
         rm -rf "$nested"
-        ln -s "$rel/${name}.framework" "$nested"
+        ln -s "$rel/Frameworks/${name}.framework" "$nested"
         count=$((count+1))
     done
     if [[ $count -gt 0 ]]; then
@@ -1014,19 +944,19 @@ inject_pythonnousersite() {
 }
 
 T_STEP=$SECONDS
-echo "==> Vendoring Homebrew dependencies"
-vendor_homebrew_deps
-echo "==> Redirecting Homebrew load commands to bundled copies"
+echo "==> Vendoring prefix dependencies"
+vendor_prefix_deps
+echo "==> Redirecting prefix load commands to bundled copies"
 rewrite_load_commands
-echo "==> Stripping /opt/homebrew rpaths"
-strip_homebrew_rpaths
-echo "==> Pruning Mach-O files with unresolvable /opt/homebrew deps"
+echo "==> Stripping prefix rpaths"
+strip_prefix_rpaths
+echo "==> Pruning Mach-O files with unresolvable prefix deps"
 prune_unfixable_machos
 echo "==> Deduplicating PySide6's bundled Qt against the main bundle Qt"
 dedupe_pyside_qt
 echo "==> Setting PYTHONNOUSERSITE=1 in Info.plist"
 inject_pythonnousersite
-echo "    [Step 6 (Vendor Homebrew deps): $((SECONDS - T_STEP))s]"
+echo "    [Step 6 (Vendor prefix deps): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
 # Step 7: Ad-hoc codesign
@@ -1058,7 +988,7 @@ sign_helper_apps() {
     done
 }
 
-# Re-seal each nested framework (Python.framework, Qt*.framework, ...).
+# Re-seal each nested framework (Qt*.framework, ...).
 # On macOS the framework version directory carries the signature.
 sign_frameworks() {
     local FW VER
@@ -1113,7 +1043,7 @@ echo "DMG complete: $DMG ($SIZE)"
 #
 # Two complementary checks per artifact:
 #   - Static scan of every Mach-O load command and LC_RPATH for any
-#     surviving Homebrew prefix reference.
+#     surviving dependency prefix reference.
 #   - Smoke launch under env -i with DYLD_PRINT_LIBRARIES=1 to catch
 #     anything that resolves at runtime via PATH or dyld fallbacks.
 # Repeated for both the .app and the .app inside the mounted DMG.
@@ -1147,23 +1077,23 @@ launch_and_trace() {
 }
 
 # Run a sandboxed launch and verify the dyld trace: enough loads happened, none
-# from host Homebrew prefixes.
+# from the dependency prefixes.
 smoke_check() {
-    local bin="$1" label="${2:-}" total brew_count
+    local bin="$1" label="${2:-}" total prefix_count
     [[ -n "$label" ]] && label=" ($label)"
     echo "==> Smoke launch${label} under sandboxed env (DYLD_PRINT_LIBRARIES=1)"
     launch_and_trace "$bin"
     total=$(grep -c '^dyld\[' "$TRACE" || true)
-    brew_count=$(grep -E '^dyld\[' "$TRACE" | grep -E -c '/opt/homebrew|/usr/local' || true)
+    prefix_count=$(grep -E '^dyld\[' "$TRACE" | grep -E -c "${HOST_PREFIX_RE#^}" || true)
     if [[ $total -lt $MIN_LOADS ]]; then
         echo "ERROR: pilot loaded only $total libraries (expected >= $MIN_LOADS);" \
              "did it crash early?" >&2
         sed -n '1,40p' "$TRACE" >&2
         exit 1
     fi
-    if [[ $brew_count -gt 0 ]]; then
-        echo "ERROR: $brew_count of $total dyld loads came from host package prefixes:" >&2
-        grep -E '^dyld\[' "$TRACE" | grep -E '/opt/homebrew|/usr/local' | head -10 \
+    if [[ $prefix_count -gt 0 ]]; then
+        echo "ERROR: $prefix_count of $total dyld loads came from dependency prefixes:" >&2
+        grep -E '^dyld\[' "$TRACE" | grep -E "${HOST_PREFIX_RE#^}" | head -10 \
             | sed 's/^/    /' >&2
         exit 1
     fi
