@@ -132,7 +132,7 @@ check_deps() {
     ok "SDK prefix: $PREFIX"
     ok "tools prefix: $TOOLS_PREFIX"
 
-    for cmd in cmake make python3 macdeployqt qtpaths otool \
+    for cmd in cmake make python3 macdeployqt qtpaths otool lipo stat \
         install_name_tool strip codesign ditto hdiutil readlink rsync shasum; do
         require_command "$cmd" || failed=1
     done
@@ -573,11 +573,46 @@ for SITE in "${SITE_DIRS[@]}"; do
         --exclude 'wheel' --exclude 'wheel-*.dist-info' \
         "$SITE/" "$BUNDLED_SITE/"
 done
-rm -rf "$BUNDLED_SITE/PySide6/scripts"
-rm -rf "$BUNDLED_SITE/PySide6/include" \
-    "$BUNDLED_SITE/shiboken6/include" \
+
+PYSIDE_BUNDLE="$BUNDLED_SITE/PySide6"
+# Prune before dependency closure so unused bindings cannot pull in Qt modules.
+for module in "$PYSIDE_BUNDLE"/Qt*.abi3.so; do
+    case "${module##*/}" in
+    QtCore.abi3.so|QtGui.abi3.so|QtWidgets.abi3.so|QtSvg.abi3.so)
+        ;;
+    *)
+        rm -f "$module"
+        ;;
+    esac
+done
+rm -f "$PYSIDE_BUNDLE"/*.pyi "$PYSIDE_BUNDLE"/libpyside6qml.*.dylib
+rm -rf "$PYSIDE_BUNDLE/Qt" "$PYSIDE_BUNDLE/QtAsyncio" \
+    "$PYSIDE_BUNDLE/scripts" "$PYSIDE_BUNDLE/include" \
+    "$PYSIDE_BUNDLE/typesystems" "$PYSIDE_BUNDLE/glue" \
+    "$PYSIDE_BUNDLE/Assistant.app" "$PYSIDE_BUNDLE/Designer.app" \
+    "$PYSIDE_BUNDLE/Linguist.app"
+rm -f "$PYSIDE_BUNDLE/svgtoqml" "$PYSIDE_BUNDLE/qmllint" \
+    "$PYSIDE_BUNDLE/qmlformat" "$PYSIDE_BUNDLE/qmlls" \
+    "$PYSIDE_BUNDLE/lrelease" "$PYSIDE_BUNDLE/lupdate"
+rm -rf "$BUNDLED_SITE/shiboken6/include" \
     "$BUNDLED_SITE/numpy/_core/include" \
     "$BUNDLED_SITE/numpy/core/include"
+
+mkdir -p "$PYSIDE_BUNDLE/Qt/lib"
+PYSIDE_QT_REL='../../../../../..'
+for module in Core Gui Widgets Svg; do
+    framework="Qt${module}.framework"
+    [[ -d "$FW_DIR/$framework" ]] || {
+        echo "ERROR: bundled $framework is missing" >&2
+        exit 1
+    }
+    ln -s "$PYSIDE_QT_REL/Frameworks/$framework" \
+        "$PYSIDE_BUNDLE/Qt/lib/$framework"
+    [[ -f "$PYSIDE_BUNDLE/Qt${module}.abi3.so" ]] || {
+        echo "ERROR: bundled PySide6.Qt$module binding is missing" >&2
+        exit 1
+    }
+done
 echo "    [Step 4 (Bundle site-packages): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
@@ -871,26 +906,27 @@ prune_unfixable_machos() {
     fi
 }
 
-# Wheel bindings search PySide6/Qt/lib, while Pilot loads AQT Qt from the
-# bundle Frameworks directory. Point duplicate wheel frameworks at that one
-# runtime so both C++ and Python use the same Qt process state.
-dedupe_pyside_qt() {
-    local pyqt_lib count=0 nested name main rel
-    pyqt_lib="$BUNDLED_SITE/PySide6/Qt/lib"
-    [[ -d "$pyqt_lib" ]] || return 0
-    rel='../../../../../..'
-    for nested in "$pyqt_lib"/Qt*.framework; do
-        [[ -d "$nested" && ! -L "$nested" ]] || continue
-        name=$(basename "$nested" .framework)
-        main="$FW_DIR/${name}.framework"
-        [[ -d "$main" && ! -L "$main" ]] || continue
-        rm -rf "$nested"
-        ln -s "$rel/Frameworks/${name}.framework" "$nested"
+thin_bundle_arm64() {
+    local count=0 BIN archs mode thin
+    while IFS= read -r -d '' BIN; do
+        archs=$(lipo -archs "$BIN" 2>/dev/null || true)
+        [[ "$archs" == *x86_64* ]] || continue
+        [[ "$archs" == *arm64* ]] || {
+            echo "ERROR: x86_64-only Mach-O in Apple Silicon bundle: $BIN" >&2
+            return 1
+        }
+        mode=$(stat -f '%Lp' "$BIN")
+        thin="${BIN}.arm64"
+        rm -f "$thin"
+        if ! lipo "$BIN" -thin arm64 -output "$thin"; then
+            rm -f "$thin"
+            return 1
+        fi
+        chmod "$mode" "$thin"
+        mv -f "$thin" "$BIN"
         count=$((count+1))
-    done
-    if [[ $count -gt 0 ]]; then
-        echo "    deduped $count PySide6 Qt framework(s)"
-    fi
+    done < <(list_macho "$APP")
+    echo "    thinned $count universal Mach-O file(s) to arm64"
 }
 
 # Set PYTHONNOUSERSITE=1 in LSEnvironment so a Finder/open launch of pilot
@@ -931,8 +967,8 @@ echo "==> Stripping prefix rpaths"
 strip_prefix_rpaths
 echo "==> Pruning Mach-O files with unresolvable prefix deps"
 prune_unfixable_machos
-echo "==> Deduplicating PySide6 Qt frameworks"
-dedupe_pyside_qt
+echo "==> Thinning universal Mach-O files to arm64"
+thin_bundle_arm64
 echo "==> Setting PYTHONNOUSERSITE=1 in Info.plist"
 inject_pythonnousersite
 echo "    [Step 6 (Vendor prefix deps): $((SECONDS - T_STEP))s]"
