@@ -86,24 +86,52 @@ SHIBOKEN_PREFIX=$("$SDK_PREFIX/bin/python3" -I -c \
 SHIBOKEN_TOOLS_PREFIX=$("$SDK_PREFIX/bin/python3" -I -c \
     'import os, shiboken6_generator; print(os.path.dirname(shiboken6_generator.__file__))')
 export CMAKE_PREFIX_PATH="$SHIBOKEN_TOOLS_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+
+# Raw standalone archives retain /install in the Python build metadata.
+SYSCONFIG_MODULE_DIR="$tmp/python-sysconfig"
+mkdir -p "$SYSCONFIG_MODULE_DIR"
+cat > "$SYSCONFIG_MODULE_DIR/_solvcon_sysconfigdata.py" <<'PY'
+import importlib
+import os
+
+build_time_vars = importlib.import_module(
+    os.environ["SOLVCON_ORIGINAL_SYSCONFIGDATA_NAME"]
+).build_time_vars.copy()
+include = os.environ["SOLVCON_PYTHON_INCLUDE"]
+build_time_vars["INCLUDEPY"] = include
+build_time_vars["CONFINCLUDEPY"] = include
+PY
+ORIGINAL_SYSCONFIGDATA_NAME=$("$SDK_PREFIX/bin/python3" -I -c \
+    'import sysconfig; print(sysconfig._get_sysconfigdata_name())')
+PYTHON_INCLUDE=$("$SDK_PREFIX/bin/python3" -I -c \
+    'import sysconfig; print(sysconfig.get_path("include"))')
+
 NPROC=$(sysctl -n hw.logicalcpu 2>/dev/null || echo 1)
 # Do not use --standalone: the bindings must load the AQT Qt installation.
+PYSIDE_BUILD_OPTIONS="--qtpaths='$SDK_PREFIX/bin/qtpaths' \
+--shiboken-target-path='$SHIBOKEN_PREFIX' \
+--module-subset=Core,Gui,Widgets,Svg \
+--macos-arch=arm64 \
+--macos-deployment-target=$MACOS_DEPLOYMENT_TARGET \
+--disable-pyi --log-level=verbose --no-qt-tools --enable-numpy-support \
+--parallel=$NPROC --make-spec=ninja"
 (
+    export _PYTHON_SYSCONFIGDATA_NAME=_solvcon_sysconfigdata
+    export _PYTHON_SYSCONFIGDATA_PATH="$SYSCONFIG_MODULE_DIR"
+    export SOLVCON_ORIGINAL_SYSCONFIGDATA_NAME="$ORIGINAL_SYSCONFIGDATA_NAME"
+    export SOLVCON_PYTHON_INCLUDE="$PYTHON_INCLUDE"
+    actual_include=$("$SDK_PREFIX/bin/python3" -I -c \
+        'import sysconfig; print(sysconfig.get_config_var("INCLUDEPY"))')
+    [[ "$actual_include" == "$PYTHON_INCLUDE" && \
+        -f "$actual_include/Python.h" ]] || {
+        echo "Invalid Python include path: $actual_include" >&2
+        exit 1
+    }
     cd "$tmp/$PYSIDE_ROOT"
-    "$SDK_PREFIX/bin/python3" setup.py install \
-        --build-type=pyside6 \
-        --qtpaths="$SDK_PREFIX/bin/qtpaths" \
-        --shiboken-target-path="$SHIBOKEN_PREFIX" \
-        --module-subset=Core,Gui,Widgets,Svg \
-        --macos-arch=arm64 \
-        --macos-deployment-target="$MACOS_DEPLOYMENT_TARGET" \
-        --disable-pyi \
-        --verbose-build \
-        --ignore-git \
-        --no-qt-tools \
-        --enable-numpy-support \
-        --parallel="$NPROC" \
-        --make-spec=ninja
+    "$SDK_PREFIX/bin/python3" -I -m pip --isolated install \
+        --no-build-isolation --no-deps \
+        --config-settings="--global-option=--build-type=pyside6" \
+        --config-settings="--build-option=$PYSIDE_BUILD_OPTIONS" .
 )
 
 PYSIDE_DIR=$("$SDK_PREFIX/bin/python3" -I - <<'PY'
