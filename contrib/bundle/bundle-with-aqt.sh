@@ -150,7 +150,6 @@ check_deps() {
     python_module_check PySide6.QtWidgets || failed=1
     python_module_check PySide6.QtSvg || failed=1
     python_module_check shiboken6 || failed=1
-    python_module_check shiboken6_generator || failed=1
     python_module_check matplotlib || failed=1
 
     if [[ $failed -ne 0 ]]; then
@@ -564,7 +563,6 @@ echo "    [Step 3 (Bundle Python runtime): $((SECONDS - T_STEP))s]"
 T_STEP=$SECONDS
 echo "==> Copying Python packages into bundled site-packages"
 for SITE in "${SITE_DIRS[@]}"; do
-    # The SDK needs the generator to build pilot; the app does not.
     rsync -aL --exclude '__pycache__' --exclude '*.pth' \
         --exclude 'test/' --exclude 'tests/' \
         --exclude 'examples/' --exclude 'benchmarks/' \
@@ -573,14 +571,8 @@ for SITE in "${SITE_DIRS[@]}"; do
         --exclude 'setuptools' --exclude 'setuptools-*.dist-info' \
         --exclude '_distutils_hack' --exclude 'pkg_resources' \
         --exclude 'wheel' --exclude 'wheel-*.dist-info' \
-        --exclude 'shiboken6_generator' \
-        --exclude 'shiboken6_generator-*' \
         "$SITE/" "$BUNDLED_SITE/"
 done
-[[ ! -d "$BUNDLED_SITE/PySide6/Qt" ]] || {
-    echo "ERROR: source-built PySide6 contains a private Qt runtime" >&2
-    exit 1
-}
 rm -rf "$BUNDLED_SITE/PySide6/scripts"
 rm -rf "$BUNDLED_SITE/PySide6/include" \
     "$BUNDLED_SITE/shiboken6/include" \
@@ -879,6 +871,28 @@ prune_unfixable_machos() {
     fi
 }
 
+# Wheel bindings search PySide6/Qt/lib, while Pilot loads AQT Qt from the
+# bundle Frameworks directory. Point duplicate wheel frameworks at that one
+# runtime so both C++ and Python use the same Qt process state.
+dedupe_pyside_qt() {
+    local pyqt_lib count=0 nested name main rel
+    pyqt_lib="$BUNDLED_SITE/PySide6/Qt/lib"
+    [[ -d "$pyqt_lib" ]] || return 0
+    rel='../../../../../..'
+    for nested in "$pyqt_lib"/Qt*.framework; do
+        [[ -d "$nested" && ! -L "$nested" ]] || continue
+        name=$(basename "$nested" .framework)
+        main="$FW_DIR/${name}.framework"
+        [[ -d "$main" && ! -L "$main" ]] || continue
+        rm -rf "$nested"
+        ln -s "$rel/Frameworks/${name}.framework" "$nested"
+        count=$((count+1))
+    done
+    if [[ $count -gt 0 ]]; then
+        echo "    deduped $count PySide6 Qt framework(s)"
+    fi
+}
+
 # Set PYTHONNOUSERSITE=1 in LSEnvironment so a Finder/open launch of pilot
 # never adds ~/Library/Python/<X.Y>/lib/python/site-packages to sys.path,
 # which on dev machines may carry a second PySide6 and Qt runtime.
@@ -917,6 +931,8 @@ echo "==> Stripping prefix rpaths"
 strip_prefix_rpaths
 echo "==> Pruning Mach-O files with unresolvable prefix deps"
 prune_unfixable_machos
+echo "==> Deduplicating PySide6 Qt frameworks"
+dedupe_pyside_qt
 echo "==> Setting PYTHONNOUSERSITE=1 in Info.plist"
 inject_pythonnousersite
 echo "    [Step 6 (Vendor prefix deps): $((SECONDS - T_STEP))s]"
